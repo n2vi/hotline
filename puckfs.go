@@ -14,12 +14,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"math"
 	"net"
 	"os"
-	"path"
+	"strconv"
 	"time"
 )
 
@@ -53,6 +54,11 @@ type PuckFS struct {
 //	in an active server, caller=address of client.
 // Fitting with rest of the design, mtu is manually set to a conservative fragmentation size.
 
+// The client API follows. Error handling is mildly aggressive in the sense of freely
+// using log.Fatal for faults in puckfs server code, since error messages will be seen
+// immediately on the Puck display and should be regarded as a priority to fix.
+// The server API at the bottom of the file is (only) somewhat more robust.
+
 // Dial calls the puckfs server and checks clocks for consistency.
 func Dial(secretfile string) (p *PuckFS, err error) {
 	var addr *net.UDPAddr
@@ -81,17 +87,64 @@ func (p *PuckFS) ReadFile(path string) (data []byte, err error) {
 	return data, expect(cReadfile, cmd, data)
 }
 
-// WriteFile writes file contents, similar to ioutil
+// WriteFile writes file contents, similar to ioutil,
 // but without permission modes since puckfs is a single-user filesystem.
 func (p *PuckFS) WriteFile(path string, data []byte) (err error) {
-	mess := []byte(path)
-	if j := bytes.IndexByte(mess, 0); j >= 0 {
-		return fmt.Errorf("zero byte not allowed in path names %d", j)
+	var mess []byte
+	if mess, err = pathPrefix(path); err != nil {
+		return err
 	}
-	mess = append(mess, 0)
 	mess = append(mess, data...)
 	cmd, mess := p.clientRPC(cWritefile, mess)
 	return expect(cWritefile, cmd, mess)
+}
+
+// Remove deletes the file.
+func (p *PuckFS) Remove(path string) (err error) {
+	cmd, mess := p.clientRPC(cRemove, []byte(path))
+	return expect(cRemove, cmd, mess)
+}
+
+// ReadDir reads a directory and returns a slice of stat data.
+func (p *PuckFS) ReadDir(path string) (fi []fs.FileInfo, err error) {
+	cmd, data := p.clientRPC(cReaddir, []byte(path))
+	if err = expect(cReaddir, cmd, data); err != nil {
+		return []fs.FileInfo{}, err
+	}
+	datalines := linesplit(data)
+	fi = make([]fs.FileInfo, len(datalines))
+	for i, s := range datalines {
+		field := bytes.Split(s, []byte("\000"))
+		if len(field) != 3 {
+			log.Fatal("can't happen; expect name,size,mtime")
+		}
+		f := myFileInfo{}
+		n := len(field[0])
+		if field[0][n-1] == '/' {
+			f.isdir = true
+			field[0] = field[0][:n-1]
+		}
+		f.name = string(field[0])
+		if f.size, err = strconv.ParseInt(string(field[1]), 10, 64); err != nil {
+			log.Fatalf("can't happen %q %s", field[1], err)
+		}
+		if f.mtime, err = strconv.ParseInt(string(field[2]), 10, 64); err != nil {
+			log.Fatalf("can't happen %q %s", field[2], err)
+		}
+		fi[i] = fs.FileInfo(f)
+	}
+	return fi, err
+}
+
+// Chtime changes the "modified" time on the file.
+func (p *PuckFS) Chtime(path string, mtime int64) (err error) {
+	var mess []byte
+	if mess, err = pathPrefix(path); err != nil {
+		return err
+	}
+	mess = strconv.AppendInt(mess, mtime, 10)
+	cmd, mess := p.clientRPC(cChtime, mess)
+	return expect(cChtime, cmd, mess)
 }
 
 // TimeToRekey is an error indication that the secretFile needs updating.
@@ -160,8 +213,8 @@ const (
 	cHello
 	cReadfile
 	cWritefile
-	cReaddir
 	cRemove
+	cReaddir
 	cChtime
 	cError
 )
@@ -533,6 +586,18 @@ func writeSecretFile(p *PuckFS) {
 	return
 }
 
+// Check filename for validity and create a zero-terminated byte array.
+// Possibly in the future we will change to a more general purpose binary design like 9P2000
+// but for now we're putting mostly-human-readable bytes into messages.
+func pathPrefix(path string) (mess []byte, err error) {
+	if fs.ValidPath(path) == false {
+		return []byte{}, errors.New("%s does not meet standards of io/fs.ValidPath")
+	}
+	mess = []byte(path)
+	mess = append(mess, 0)
+	return mess, nil
+}
+
 // The append/consume functions are from go/src/crypto/sha1/sha1.go.
 
 func appendUint64(b []byte, x uint64) []byte {
@@ -657,6 +722,7 @@ func (p *PuckFS) HandleRPC() {
 			continue
 		}
 		resp := []byte{}
+		var file string
 		switch cmd {
 		case cHello:
 			now := time.Now().UTC()
@@ -675,8 +741,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cReadfile:
-			file := path.Clean(string(req))
-			if len(file) < 1 || file[0] == '/' {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -690,20 +755,68 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cWritefile:
-			// Extract zero-byte terminated file name. Remainder is file contents.
-			j := bytes.IndexByte(req, 0)
-			if j < 0 {
-				reject(p, cError, "missing filename")
-				continue
-			}
-			file := string(req[:j])
-			req = req[j+1:]
-			file = path.Clean(file)
-			if len(file) < 1 || file[0] == '/' {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
 			if err = ioutil.WriteFile(file, req, 0600); err != nil { // create under local directory
+				reject(p, cError, err.Error())
+				continue
+			}
+			if err = p.sendCmd(cWritefile, resp); err != nil {
+				log.Printf("cWritefile sendCmd err %v", err)
+				hangup(p)
+				return
+			}
+		case cRemove:
+			if file, req, err = extractFilename(req); err != nil {
+				reject(p, cError, "bad filename")
+				continue
+			}
+			if err = os.Remove(file); err != nil {
+				reject(p, cError, err.Error())
+				continue
+			}
+			if err = p.sendCmd(cRemove, resp); err != nil {
+				log.Printf("cReadfile err %v", err)
+				hangup(p)
+				return
+			}
+		case cReaddir:
+			if file, req, err = extractFilename(req); err != nil {
+				reject(p, cError, "bad filename")
+				continue
+			}
+			var fi []fs.FileInfo
+			if fi, err = ioutil.ReadDir(file); err != nil {
+				reject(p, cError, err.Error())
+				continue
+			}
+			for _, f := range fi {
+				suffix := ""
+				if f.IsDir() {
+					suffix = "/"
+				}
+				resp = append(resp, fmt.Sprintf("%s%s\000%d\000%d\n",
+					f.Name(), suffix, f.Size(), f.ModTime().Unix())...)
+			}
+			if err = p.sendCmd(cReaddir, resp); err != nil {
+				log.Printf("cReaddir err %v", err)
+				hangup(p)
+				return
+			}
+		case cChtime:
+			var t int64
+			if file, req, err = extractFilename(req); err != nil {
+				reject(p, cError, "bad filename")
+				continue
+			}
+			if t, err = strconv.ParseInt(string(req), 10, 64); err != nil {
+				reject(p, cError, err.Error())
+				continue
+			}
+			mtime := time.Unix(t, 0)
+			if err = os.Chtimes(file, mtime, mtime); err != nil {
 				reject(p, cError, err.Error())
 				continue
 			}
@@ -722,6 +835,74 @@ func (p *PuckFS) HandleRPC() {
 	}
 }
 
+// Extract zero-byte terminated file name (or entire input).
+func extractFilename(req  []byte) (file string, remainder []byte, err error) {
+		j := bytes.IndexByte(req, 0)
+		if j < 0 {
+			file = string(req)
+			remainder = []byte{}
+		} else {
+			file = string(req[:j])
+			remainder = req[j+1:]
+		}
+		
+		if fs.ValidPath(file) == false {
+			return "", req, errBye
+		}
+		return file, remainder, nil
+}
+
+// myFileInfo implements fs.FileInfo
+type myFileInfo struct {
+	name string
+	size int64
+	mtime int64
+	isdir bool
+}
+
+func (fi myFileInfo) Name() string {
+	return fi.name
+}
+
+func (fi myFileInfo) Size() int64 {
+	return fi.size
+}
+
+func (fi myFileInfo) Mode() fs.FileMode {
+	bits := fs.FileMode(0600)
+	if fi.isdir {
+		bits |= fs.ModeDir
+	}
+	return bits
+}
+
+func (fi myFileInfo) ModTime() time.Time {
+	return time.Unix(fi.mtime, 0)
+}
+
+func (fi myFileInfo) IsDir() bool {
+	return fi.isdir
+}
+
+func (fi myFileInfo) Sys() interface{} {
+	return nil
+}
+
+// Linesplit separates byte array at newlines.
+func linesplit(data []byte) (lines [][]byte) {
+	// lines = make([][]byte, 0, 100)
+	for len(data) > 0 {
+		j := bytes.IndexByte(data, '\n')
+		if j < 0 {
+			log.Fatal("can't happen; no trailing newline")
+		}
+		lines = append(lines, data[:j])
+		data = data[j+1:]
+	}
+	return lines
+}
+
+// Reject sends error message, else fatal.
 func reject(p *PuckFS, cmd uint16, mess string) {
 	var err error
 	log.Printf("rejected %x %s", cmd, mess)
