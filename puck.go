@@ -1,11 +1,12 @@
 // Copyright (c) 2020 Eric Grosse n2vi.com/0BSD
 
-// Command puck implements hotline cryptography.
-// This version implements a command line interface, which I use with the
-// acme editor as GUI.
-//
-// Just working out ideas; don't consider this anywhere near finished.
+/*
+	Command puck implements hotline cryptography.
+	This version implements a command line interface, which I use with the
+	acme editor as GUI.
 
+	Just working out ideas; don't consider this anywhere near finished.
+*/
 package main
 
 import (
@@ -17,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"io/ioutil"
 	"log"
 	"math"
@@ -73,18 +75,14 @@ var nickP map[string]Principal
 var keyCount map[uint32]uint32
 var Messages []Message
 var MessageCounter int
-var roccs *PuckFS
+var broker *PuckFS
 
+// Send to (nicks) the (text) of form (msgtype), interpreting as filename if (indirect).
+// Return the Message struct or error.
 func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Message, error) {
 	var m Message
 	var ovfl error
 	var err error
-
-	if roccs == nil {
-		if roccs, err = Dial("clientdemo"); err != nil {
-			log.Fatalf("unable to Dial roccs")
-		}
-	}
 
 	m.Date = time.Now().Unix()
 	m.From = db.Me
@@ -152,11 +150,14 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 		}
 		ciphertext := aesgcm.Seal(nil, nonce, plaintext, nil)
 		keyCount[r.My.KeyID] = keyCount[r.My.KeyID] + uint32(n)
-		file := fmt.Sprintf("%0x/%0x", r.Id, keyCount[r.My.KeyID])
+		file := fmt.Sprintf("%s/%08x", nicks[i], keyCount[r.My.KeyID])
 		nonce = append(nonce, ciphertext...)
-		if roccs != nil {
-			if err = roccs.WriteFile(file, nonce); err != nil {
-				return m, fmt.Errorf("failed attempting delivery to %s: %s", nicks[i], err)
+		if broker != nil {
+			if broker.sec.DEBUG {
+				fmt.Printf("WriteFile %s\n", file)
+			}
+			if err = broker.WriteFile(file, nonce); err != nil {
+				return m, fmt.Errorf("failed delivery to %s: %s", nicks[i], err)
 			}
 		}
 		saveKeyCount() // somewhat wasteful but safest
@@ -166,6 +167,7 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 	// This is a soft fail; don't ignore it, but don't panic.
 }
 
+// We received an encrypted message with (keyID); let's figure out who it is from.
 func peerLookup(keyID uint32) (p *Principal, err error) {
 	for _, peer := range db.Peers {
 		if peer.Their.KeyID == keyID {
@@ -175,6 +177,7 @@ func peerLookup(keyID uint32) (p *Principal, err error) {
 	return p, fmt.Errorf("no peer found for keyID %0x", keyID)
 }
 
+// We received (data) which may be malicious. Either return parsed Message struct or error.
 func validateMessage(data []byte) (m Message, err error) {
 	var sender *Principal
 	nonce := data[:12]
@@ -203,7 +206,7 @@ func validateMessage(data []byte) (m Message, err error) {
 	if ver != VERSION {
 		return m, fmt.Errorf("mismatched VERSION; got %x, want %x", ver, VERSION)
 	}
-	copy(plaintext[4:8], m.MsgType)
+	m.MsgType = MessageType(plaintext[4:8])
 	m.Date = int64(binary.BigEndian.Uint64(plaintext[8:16]))
 	m.From = ID(binary.BigEndian.Uint32(plaintext[16:20]))
 	nr := int(binary.BigEndian.Uint16(plaintext[20:22]))
@@ -221,6 +224,7 @@ func validateMessage(data []byte) (m Message, err error) {
 	return m, nil
 }
 
+// Convert Message file contents (b) from file (fn) to Message struct.
 // Message files have the following format, intended for anyone to be able to read
 // even if they have never seen any documentation or source code.
 // date nnnnnnnnnn local time including zone
@@ -277,6 +281,16 @@ func unmarshalMessage(fn string, b []byte) (Message, error) {
 }
 
 // parseDraft is very similar to unmarshalMessage, but for human-created input.
+// Specifically, it expects (b) of the form
+//    to nicks
+//
+//    some text
+// or perhaps
+//    to nicks
+//    msgtype JPEG
+//    indirect
+//
+//    foo.jpg
 func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
 	var v string
 	var err error
@@ -310,20 +324,22 @@ func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
 	return b[1:], MessageType(typ), indirect, nicks, nil
 }
 
-// Decrypted messages are stored as individual files "m/aa/bb".
+// At command startup, load all the messages.
+// Decrypted messages are locally stored as individual files "m/aa/bb".
+// TODO return err
 func readMessages() {
 	md, err := ioutil.ReadDir("m")
 	if err != nil || len(md) < 1 {
-		log.Fatalf("missing messages directory? %s", err)
+		log.Fatalf("missing messages directory? %d %s", len(md), err)
 	}
 	mdf := md[0].Name()
-	candidate := 0
+	messno := 0
 	for {
-		mf := filenameMessage(candidate)
+		mf := filenameMessage(messno)
 		if mf[2:4] != mdf {
 			// As a performance optimization, don't try reading non-existent directory.
 			if mf[2:4] < mdf { // only expected if message subdirs were archived
-				candidate++
+				messno++
 				continue
 			} // else mf[2:4] > mdf
 			if len(md) == 1 {
@@ -335,7 +351,7 @@ func readMessages() {
 		}
 		b, err := ioutil.ReadFile(mf)
 		if os.IsNotExist(err) {
-			candidate++
+			messno++
 			continue
 		}
 		if err != nil {
@@ -346,23 +362,24 @@ func readMessages() {
 			log.Fatalf("unable to parse %s: %s", mf, err)
 		}
 		Messages = append(Messages, mess)
-		MessageCounter = candidate
-		candidate++
+		MessageCounter = messno
+		messno++
 	}
 	if MessageCounter > 400000 {
 		log.Fatalf("past time for a new Message database!")
 	}
 	if MessageCounter > 40000 {
-		log.Printf("time for a new Message database design %d", candidate)
+		log.Printf("time for a new Message database design %d", messno)
 	}
 }
 
+// When sending a message, archive locally. Try not to drop anything without warning.
 func storeMessage(mess Message) error {
 	MessageCounter++
 	bb := filenameMessage(MessageCounter)
 	err := os.MkdirAll(path.Dir(bb), 0700)
 	if err != nil {
-		log.Fatalf("unable to create message directory %s: %s", path.Dir(bb), err)
+		return fmt.Errorf("unable to create message directory %s: %s", path.Dir(bb), err)
 	}
 	f, err := os.Open(bb)
 	if err == nil {
@@ -481,7 +498,7 @@ func hdrInt64(b []byte, prefix string) ([]byte, int64, error) {
 		}
 		j := bytes.IndexByte(b[n+i:], byte('\n'))
 		if j < 0 {
-			log.Fatalf("unterminated line")
+			return b, 0, fmt.Errorf("unterminated line")
 		}
 		return b[n+i+j+1:], val, nil
 	}
@@ -498,7 +515,7 @@ func hdrUint32Hex(b []byte, prefix string) ([]byte, uint32, error) {
 		}
 		j := bytes.IndexByte(b[n+i:], byte('\n'))
 		if j < 0 {
-			log.Fatalf("unterminated line")
+			return b, 0, fmt.Errorf("unterminated line")
 		}
 		return b[n+i+j+1:], uint32(val), nil
 	}
@@ -534,9 +551,6 @@ func initialLoad() {
 		log.Fatalf("PrincipalsDB unmarshal failed: %s", err)
 	}
 	np := len(db.Peers)
-	if np == 0 {
-		log.Fatalf("PrincipalsDB unmarshal found no peers")
-	}
 	nick = make(map[ID]string, np+1)
 	nickP = make(map[string]Principal, np)
 	nick[db.Me] = "me"
@@ -559,42 +573,68 @@ func initialLoad() {
 
 }
 
+// Puck is a command line tool for sending, receiving, and storing messages.
+// It takes one argument, as show in the switch below, corresponding to a single operation.
+// It wastefully reads the full database each time, but that is expected to be fast and
+// we prefer not to have the complexity of an interactive application.
+// Use your favorite text editor and file browser; invoke this from inside.
 func main() {
 	var err error
-	if len(os.Args) < 2 {
-		wd, err := os.Getwd()
-		if err != nil {
-			log.Fatalf("Can't win; can't break even; can't even leave the game. %s", err)
-		}
-		fmt.Printf("missing subcommand in %s\n", wd)
+	if err = main2(); err != nil {
+		os.Stderr.WriteString(err.Error())
 		os.Exit(2)
 	}
-	initialLoad()
-	defer roccsClose()
+}
+
+func main2() (err error){
+	var data []byte
+	if len(os.Args) < 2 {
+		return errors.New("missing subcommand")
+	}
+	defer brokerClose()
 
 	switch os.Args[1] {
-	case "f", "fetch":
-		var data []byte
+	case "f", "fetch": // Retrieve any pending traffic from broker.
+		var fi []fs.FileInfo
 		var mess Message
-		if roccs == nil {
-			if roccs, err = Dial("clientdemo"); err != nil {
-				log.Fatalf("unable to Dial roccs")
+		initialLoad()
+		brokerOpen()
+		if fi, err = broker.ReadDir("in"); err != nil {
+			return fmt.Errorf("broker: in: %v", err)
+		}
+		for _, file := range fi {
+			fn := file.Name()
+			if file.IsDir() {
+				return fmt.Errorf("unexpected directory in/%s", fn)
+			}
+			if data, err = broker.ReadFile("in/"+fn); err != nil {
+				return fmt.Errorf("read err on message: %v", err)
+			}
+			if mess, err = validateMessage(data); err != nil {
+				return fmt.Errorf("unable to validate mess: %s", err)
+			}
+			// TODO skip duplicates
+			// TODO split out JPEG indirect
+			Messages = append(Messages, mess)
+			if err = storeMessage(mess); err != nil {
+				return fmt.Errorf("storeMessage failed: %s", err)
+			}
+			if err = broker.Remove("in/"+fn); err != nil {
+				return fmt.Errorf("unable to remove in/%s: %s", fn, err)
 			}
 		}
-		// TODO read more than one
-		if data, err = roccs.ReadFile("in/aa"); err != nil {
-			log.Printf("no mess")
-			os.Exit(4)
+	case "keygen": // new puck - broker pair
+		id := (random() & 0x00fffffe) | (puckfsVERSION << 24)
+		sec := &secretFile{false, 0, 0, 0, 0, "127.0.0.1:9901", 1000, id, Keygen()}
+		if data, err = json.MarshalIndent(sec, "", "\t"); err != nil {
+			return fmt.Errorf("%v", err)
 		}
-		if mess, err = validateMessage(data); err != nil {
-			roccsClose()
-			log.Fatalf("unable to validate mess: %s", err)
+		data = append(data, '\n')
+		if _, err = fmt.Printf("%s\n", data); err != nil {
+			return fmt.Errorf("%v", err)
 		}
-		// TODO skip duplicates
-		// TODO implement JPEG indirect
-		Messages = append(Messages, mess)
-		MessageCounter++
-	case "l", "list":
+	case "l", "list": // Show all saved messages, sent or received.
+		initialLoad()
 		for _, msg := range Messages {
 			t := time.Unix(msg.Date, 0).Format("2006-01-02 15:04:05")
 			dir := "<"
@@ -616,69 +656,78 @@ func main() {
 		}
 	case "n", "newpeer":
 		// placeholder until we adopt the face-to-face key exchange protocol
+		initialLoad()
 		db.Peers = append(db.Peers, newPeer("newFriend"))
 		x, err := json.MarshalIndent(db, "", " ")
 		if err != nil {
-			roccsClose()
-			log.Fatalf("json.Marshal failed: %s", err)
+			return fmt.Errorf("json.Marshal failed: %s", err)
 		}
+		x = append(x, '\n')
 		sav := fmt.Sprintf("archiveDB/%d", time.Now().Unix())
 		err = os.Rename("PrincipalsDB", sav)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("archiving PrincipalsDB failed: %s", err)
+			return fmt.Errorf("archiving PrincipalsDB failed: %s", err)
 		}
 		err = ioutil.WriteFile("PrincipalsDB", x, 0400)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("Yikes! writing PrincipalsDB failed: %s", err)
+			return fmt.Errorf("Yikes! writing PrincipalsDB failed: %s", err)
 		}
 		// now exit and let user edit the Nick and Note entries in PrincipalsDB
 	case "puckfs-share":
-		// This is for testing only. The real puckfs server is part of ROCCS, not puck.
+		// This is for testing only. The real puckfs server is part of broker, not puck.
 		var p *PuckFS
-		if err = os.Chdir("puckfs-share"); err != nil {
-			roccsClose()
-			log.Fatalf("%v", err)
+		if len(os.Args) < 3 {
+			return errors.New("usage: hotline puckfs-share {dir}")
 		}
-		if p, err = Listen("../serverdemo"); err != nil {
-			roccsClose()
-			log.Fatalf("%v", err)
+		if p, err = Listen("broker-secret"); err != nil {
+			return fmt.Errorf("Listen with broker-secret: %v", err)
 		}
+		if err = os.Chdir(os.Args[2]); err != nil {
+			return fmt.Errorf("chdir %s: %v", os.Args[2], err)
+		}
+		// TODO  unveil(".","rwc")
 		p.HandleRPC()
 	case "s", "send":
+		initialLoad()
 		b, err := ioutil.ReadAll(os.Stdin)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("failed read stdin: %s", err)
+			return fmt.Errorf("failed read stdin: %s", err)
 		}
 		b, msgtyp, indirect, recipients, err := parseDraft(b)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("failed parsing draft message: %s", err)
+			return fmt.Errorf("failed parsing draft message: %s", err)
 		}
+		brokerOpen()
 		mess, err := sendTo(recipients, string(b), msgtyp, indirect)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("sendTo failed: %s", err)
+			return fmt.Errorf("sendTo: %s", err)
 		}
 		Messages = append(Messages, mess)
 		err = storeMessage(mess)
 		if err != nil {
-			roccsClose()
-			log.Fatalf("storeMessage failed: %s", err)
+			return fmt.Errorf("storeMessage failed: %s", err)
 		}
 	case "v", "version":
 		fmt.Printf("puck magic 0x%x\n", VERSION)
 	default:
-		fmt.Printf("unrecognized subcommand %s\n", os.Args[1])
-		os.Exit(3)
+		return fmt.Errorf("unrecognized subcommand %s\n", os.Args[1])
+	}
+	return
+}
+
+func brokerOpen() {
+	var err error
+	if broker != nil {
+		return
+	}
+	if broker, err = Dial("puck-secret"); err != nil {
+		log.Fatalf("unable to Dial broker: %v", err)
 	}
 }
 
-func roccsClose() {
-	if roccs != nil {
-		roccs.Close()
+func brokerClose() {
+	if broker != nil {
+		broker.Close()
+		broker = nil
 	}
-	roccs = nil
 }
