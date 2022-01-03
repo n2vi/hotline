@@ -5,7 +5,15 @@
 	This version implements a command line interface, which I use with the
 	acme editor as GUI.
 
-	Just working out ideas; don't consider this anywhere near finished.
+	A message is delivered by writing files named "recipient/keycount"
+	on the sender's broker via the "puckfs" network protocol. In theory,
+	that broker would have a set of heuristics for how to deliver to the
+	recipient's broker through the high-resilience ROCCS network,
+	though in our current demonstration system that is merely
+	moving the message file from one directory to another.
+
+	Just working out ideas here; don't consider this final.
+	Comments welcome to grosse@gmail.com.
 */
 package main
 
@@ -14,6 +22,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -32,7 +41,7 @@ import (
 
 const (
 	VERSION         = 0x484f5431 // "HOT1"
-	AES256GCMkeyalg = 1
+	AES256GCMkeyalg = 1          // the default here, but expect others
 )
 
 type ID uint32          // static, globally-unique identifier of a principal
@@ -42,7 +51,7 @@ var unmatchedError = errors.New("unmatched")
 
 type PrincipalsDB struct {
 	Me    ID // my (puck's) identity
-	Peers []Principal
+	Peers []*Principal
 }
 
 type Principal struct {
@@ -71,7 +80,7 @@ type Message struct {
 
 var db PrincipalsDB
 var nick map[ID]string
-var nickP map[string]Principal
+var nickP map[string]*Principal
 var keyCount map[uint32]uint32
 var Messages []Message
 var MessageCounter int
@@ -171,7 +180,7 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 func peerLookup(keyID uint32) (p *Principal, err error) {
 	for _, peer := range db.Peers {
 		if peer.Their.KeyID == keyID {
-			return &peer, nil
+			return peer, nil
 		}
 	}
 	return p, fmt.Errorf("no peer found for keyID %0x", keyID)
@@ -437,14 +446,6 @@ func random() uint32 {
 	return binary.BigEndian.Uint32(buf[:])
 }
 
-func newPeer(nick string) (p Principal) {
-	p.Id = ID(random())
-	p.Nick = nick
-	p.My = newKey()
-	p.Their = newKey()
-	return p
-}
-
 func newKey() (k Key) {
 	k.KeyID = random()
 	k.KeyAlg = AES256GCMkeyalg
@@ -552,7 +553,7 @@ func initialLoad() {
 	}
 	np := len(db.Peers)
 	nick = make(map[ID]string, np+1)
-	nickP = make(map[string]Principal, np)
+	nickP = make(map[string]*Principal, np)
 	nick[db.Me] = "me"
 	for _, p := range db.Peers {
 		nick[p.Id] = p.Nick
@@ -574,19 +575,19 @@ func initialLoad() {
 }
 
 // Puck is a command line tool for sending, receiving, and storing messages.
-// It takes one argument, as show in the switch below, corresponding to a single operation.
+// It takes one argument, as shown in the switch below, corresponding to a single operation.
 // It wastefully reads the full database each time, but that is expected to be fast and
 // we prefer not to have the complexity of an interactive application.
 // Use your favorite text editor and file browser; invoke this from inside.
 func main() {
 	var err error
 	if err = main2(); err != nil {
-		os.Stderr.WriteString(err.Error())
+		os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(2)
 	}
 }
 
-func main2() (err error){
+func main2() (err error) {
 	var data []byte
 	if len(os.Args) < 2 {
 		return errors.New("missing subcommand")
@@ -607,7 +608,7 @@ func main2() (err error){
 			if file.IsDir() {
 				return fmt.Errorf("unexpected directory in/%s", fn)
 			}
-			if data, err = broker.ReadFile("in/"+fn); err != nil {
+			if data, err = broker.ReadFile("in/" + fn); err != nil {
 				return fmt.Errorf("read err on message: %v", err)
 			}
 			if mess, err = validateMessage(data); err != nil {
@@ -619,11 +620,38 @@ func main2() (err error){
 			if err = storeMessage(mess); err != nil {
 				return fmt.Errorf("storeMessage failed: %s", err)
 			}
-			if err = broker.Remove("in/"+fn); err != nil {
+			if err = broker.Remove("in/" + fn); err != nil {
 				return fmt.Errorf("unable to remove in/%s: %s", fn, err)
 			}
 		}
-	case "keygen": // new puck - broker pair
+	case "introduction":
+		if len(os.Args) < 4 {
+			return errors.New("usage: hotline introduction 12345 eric")
+		}
+		var id uint64
+		id, err = strconv.ParseUint(os.Args[2], 10, 32)
+		if err != nil {
+			return fmt.Errorf("unexpected Id format %s: %s", os.Args[2], err)
+		}
+		var p Principal
+		p.Id = ID(uint32(id))
+		p.Nick = os.Args[3]
+		p.Note = "introduction " + time.Now().Format(time.RFC3339)
+		p.My = newKey() // random values just to prevent accidents
+		p.Their = newKey()
+		initialLoad()
+		if ex, ok := nick[p.Id]; ok {
+			return fmt.Errorf("Id %d already in use by %s", p.Id, ex)
+		}
+		if pex, ok := nickP[p.Nick]; ok {
+			return fmt.Errorf("nickname %s already in use with Id %d", p.Nick, pex.Id)
+		}
+		db.Peers = append(db.Peers, &p)
+		nick[p.Id] = p.Nick
+		nickP[p.Nick] = &p
+		err = saveDB()
+		// next step will be face-to-face "rekey" to overwrite the random values
+	case "keygen": // new puck - broker pair, an expert-level tool for prototype puck setup
 		id := (random() & 0x00fffffe) | (puckfsVERSION << 24)
 		sec := &secretFile{false, 0, 0, 0, 0, "127.0.0.1:9901", 1000, id, Keygen()}
 		if data, err = json.MarshalIndent(sec, "", "\t"); err != nil {
@@ -637,9 +665,11 @@ func main2() (err error){
 		initialLoad()
 		for _, msg := range Messages {
 			t := time.Unix(msg.Date, 0).Format("2006-01-02 15:04:05")
-			dir := "<"
-			if msg.From == db.Me {
-				dir = ">"
+			dir := ">"
+			correspondent := nick[msg.To[0]]
+			if msg.From != db.Me {
+				dir = "<"
+				correspondent = nick[msg.From]
 			}
 			ellipsis := ""
 			if len(msg.To) > 1 {
@@ -652,32 +682,13 @@ func main2() (err error){
 			if j > 40 {
 				j = 40
 			}
-			fmt.Printf("%s %s %s%s%s %q\n", msg.fn, t, dir, nick[msg.To[0]], ellipsis, msg.Body[:j])
+			fmt.Printf("%s %s %s%s%s %q\n", msg.fn, t, dir, correspondent, ellipsis, msg.Body[:j])
 		}
-	case "n", "newpeer":
-		// placeholder until we adopt the face-to-face key exchange protocol
-		initialLoad()
-		db.Peers = append(db.Peers, newPeer("newFriend"))
-		x, err := json.MarshalIndent(db, "", " ")
-		if err != nil {
-			return fmt.Errorf("json.Marshal failed: %s", err)
-		}
-		x = append(x, '\n')
-		sav := fmt.Sprintf("archiveDB/%d", time.Now().Unix())
-		err = os.Rename("PrincipalsDB", sav)
-		if err != nil {
-			return fmt.Errorf("archiving PrincipalsDB failed: %s", err)
-		}
-		err = ioutil.WriteFile("PrincipalsDB", x, 0400)
-		if err != nil {
-			return fmt.Errorf("Yikes! writing PrincipalsDB failed: %s", err)
-		}
-		// now exit and let user edit the Nick and Note entries in PrincipalsDB
 	case "puckfs-share":
-		// This is for testing only. The real puckfs server is part of broker, not puck.
+		// This is for prototype testing only. The real puckfs server is part of broker, not puck.
 		var p *PuckFS
 		if len(os.Args) < 3 {
-			return errors.New("usage: hotline puckfs-share {dir}")
+			return errors.New("usage: hotline puckfs-share dir")
 		}
 		if p, err = Listen("broker-secret"); err != nil {
 			return fmt.Errorf("Listen with broker-secret: %v", err)
@@ -687,6 +698,41 @@ func main2() (err error){
 		}
 		// TODO  unveil(".","rwc")
 		p.HandleRPC()
+	case "rekey":
+		// This is an experiment in how to set or reset the keys for a pair of
+		// principals. It has the advantage that the Puck never needs to listen
+		// on a port, unlike face-to-face ethernet. But it is not a general solution
+		// because random strings are awkward to type and not really random
+		// and the system is specific to AES keylength.
+		initialLoad()
+		if len(os.Args) != 4 {
+			return errors.New("usage: hotline rekey eric 'random string'")
+		}
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		r := os.Args[3]
+		if len(r) < 16 {
+			return fmt.Errorf("implausibly short: %s", r)
+		}
+		p.Note = "rekey " + time.Now().Format(time.RFC3339)
+		b := make([]byte, 4+len(r))
+		// My.Key
+		binary.BigEndian.PutUint32(b[0:], uint32(db.Me))
+		b = append(b, r...)
+		sum := sha512.Sum384(b)
+		p.My.KeyID = binary.BigEndian.Uint32(sum[0:4])
+		p.My.KeyAlg = AES256GCMkeyalg
+		copy(p.My.Secret, sum[4:36])
+		// Their.Key
+		binary.BigEndian.PutUint32(b[0:], uint32(p.Id))
+		b = append(b, r...)
+		sum = sha512.Sum384(b)
+		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
+		p.Their.KeyAlg = AES256GCMkeyalg
+		copy(p.Their.Secret, sum[4:36])
+		err = saveDB()
 	case "s", "send":
 		initialLoad()
 		b, err := ioutil.ReadAll(os.Stdin)
@@ -711,6 +757,25 @@ func main2() (err error){
 		fmt.Printf("puck magic 0x%x\n", VERSION)
 	default:
 		return fmt.Errorf("unrecognized subcommand %s\n", os.Args[1])
+	}
+	return
+}
+
+func saveDB() (err error) {
+	var x []byte
+	x, err = json.MarshalIndent(db, "", " ")
+	if err != nil {
+		return fmt.Errorf("json.Marshal failed: %s", err)
+	}
+	x = append(x, '\n')
+	sav := fmt.Sprintf("archiveDB/%d", time.Now().Unix())
+	err = os.Rename("PrincipalsDB", sav)
+	if err != nil {
+		return fmt.Errorf("archiving PrincipalsDB failed: %s", err)
+	}
+	err = ioutil.WriteFile("PrincipalsDB", x, 0400)
+	if err != nil {
+		return fmt.Errorf("Yikes! writing PrincipalsDB failed: %s", err)
 	}
 	return
 }
