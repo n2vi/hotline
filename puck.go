@@ -41,7 +41,7 @@ import (
 
 const (
 	VERSION         = 0x484f5431 // "HOT1"
-	AES256GCMkeyalg = 1          // the default here, but expect others
+	AES256GCMkeyalg = 1 // the default here, but expect others
 )
 
 type ID uint32          // static, globally-unique identifier of a principal
@@ -582,12 +582,12 @@ func initialLoad() {
 func main() {
 	var err error
 	if err = main2(); err != nil {
-		os.Stderr.WriteString(err.Error() + "\n")
+		os.Stderr.WriteString(err.Error()+"\n")
 		os.Exit(2)
 	}
 }
 
-func main2() (err error) {
+func main2() (err error){
 	var data []byte
 	if len(os.Args) < 2 {
 		return errors.New("missing subcommand")
@@ -608,7 +608,7 @@ func main2() (err error) {
 			if file.IsDir() {
 				return fmt.Errorf("unexpected directory in/%s", fn)
 			}
-			if data, err = broker.ReadFile("in/" + fn); err != nil {
+			if data, err = broker.ReadFile("in/"+fn); err != nil {
 				return fmt.Errorf("read err on message: %v", err)
 			}
 			if mess, err = validateMessage(data); err != nil {
@@ -620,7 +620,7 @@ func main2() (err error) {
 			if err = storeMessage(mess); err != nil {
 				return fmt.Errorf("storeMessage failed: %s", err)
 			}
-			if err = broker.Remove("in/" + fn); err != nil {
+			if err = broker.Remove("in/"+fn); err != nil {
 				return fmt.Errorf("unable to remove in/%s: %s", fn, err)
 			}
 		}
@@ -720,14 +720,14 @@ func main2() (err error) {
 		b := make([]byte, 4+len(r))
 		// My.Key
 		binary.BigEndian.PutUint32(b[0:], uint32(db.Me))
-		b = append(b, r...)
+		copy(b[4:], []byte(r))
 		sum := sha512.Sum384(b)
 		p.My.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.My.KeyAlg = AES256GCMkeyalg
 		copy(p.My.Secret, sum[4:36])
 		// Their.Key
 		binary.BigEndian.PutUint32(b[0:], uint32(p.Id))
-		b = append(b, r...)
+		copy(b[4:], []byte(r))
 		sum = sha512.Sum384(b)
 		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.Their.KeyAlg = AES256GCMkeyalg
@@ -761,7 +761,7 @@ func main2() (err error) {
 	return
 }
 
-func saveDB() (err error) {
+func saveDB() (err error){
 	var x []byte
 	x, err = json.MarshalIndent(db, "", " ")
 	if err != nil {
