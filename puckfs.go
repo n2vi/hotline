@@ -4,7 +4,7 @@
 	Package puckfs provides a primitive network file server and client,
 	atop Go-Back-N retransmission and transport encryption, atop udp.
 */
-package main // will become github.com/n2vi/puckfs
+package main
 
 import (
 	"bytes"
@@ -45,7 +45,7 @@ type PuckFS struct {
 	keyID          uint32
 	secret         []byte // base64.StdEncoding.DecodeString(Secret[10:])
 	sec            *secretFile
-	secretF       *os.File // "puck-secret" or "broker-secret", held to enable unveil()
+	secretF       *os.File // "puck-secret" or "broker-secret", held to enable unveil() someday
 }
 
 // Auxiliary routing information in PuckFS is currently just caller and mtu.
@@ -70,9 +70,6 @@ func Dial(secretfile string) (p *PuckFS, err error) {
 	}
 	if p.udp, err = net.DialUDP("udp", nil, addr); err != nil {
 		return p, err
-	}
-	if p.sec.DEBUG {
-		log.Printf("hotline DEBUG uses # as seqno prefix, ## as Ack seqno")
 	}
 	cmd, data := p.clientRPC(cHello, []byte(time.Now().UTC().Format(time.RFC3339)))
 	if err = expect(cHello, cmd, data); err != nil {
@@ -287,10 +284,10 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 		plaintext, data = p.marshal(cmd, data)
 		ciphertext := make([]byte, len(plaintext)+16) // add room for auth tag
 		asconEncrypt(ciphertext, plaintext, []byte{}, p.secret)
-		p.write(ciphertext)
 		if p.sec.DEBUG {
-			log.Printf(" send #%d", p.snd.w)
+			log.Printf("sending %d bytes %s", len(ciphertext), p.packetCounters())
 		}
+		p.write(ciphertext)
 		if ok := p.snd.push(ciphertext, time.Now().Add(sendTimeout)); !ok {
 			log.Fatal("can't happen; send ring buffer overflow") // we checked above
 		}
@@ -303,6 +300,9 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 
 // Read an RPC request or response.
 func (p *PuckFS) readCmd() (cmd uint16, r []byte, err error) {
+	if p.sec.DEBUG {
+		log.Printf("readCmd %s", cmdNames[cmd])
+	}
 	r = make([]byte, 0)
 	var data []byte
 	var ok bool
@@ -328,9 +328,6 @@ func (p *PuckFS) readCmd() (cmd uint16, r []byte, err error) {
 	if packetCount%(ringN/2) != 0 { // avoid duplicate Ack
 		p.sendAck(cAck)
 	}
-	if p.sec.DEBUG {
-		log.Printf("readCmd %s", cmdNames[cmd])
-	}
 	return
 }
 
@@ -338,9 +335,6 @@ func (p *PuckFS) readCmd() (cmd uint16, r []byte, err error) {
 func (p *PuckFS) sendAck(cmd uint16) {
 	if p.caller == &unsetCaller {
 		return // If server hasn't seen an authenticated packet yet, then no place to send to.
-	}
-	if p.sec.DEBUG {
-		log.Printf("send ##%d %s await#%d", p.sndAck, cmdNames[cmd], p.rcv.w)
 	}
 	msg := make([]byte, 4)
 	binary.BigEndian.PutUint32(msg, p.rcv.w) // packet seqno we are awaiting
@@ -350,6 +344,9 @@ func (p *PuckFS) sendAck(cmd uint16) {
 	}
 	ciphertext := make([]byte, len(plaintext)+16)
 	asconEncrypt(ciphertext, plaintext, []byte{}, p.secret)
+	if p.sec.DEBUG {
+		log.Printf("%s %s", cmdNames[cmd], p.packetCounters())
+	}
 	p.write(ciphertext)
 }
 
@@ -381,7 +378,7 @@ func (p *PuckFS) readPacket() (err error) {
 	for { // keep reading and QAcking until we get a valid packet
 		if ciphertext, caller, err = p.read(ciphertext); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				log.Printf("deadline exceeded")
+				// log.Printf("deadline exceeded")
 				p.sendAck(cQAck)
 				p.udp.SetReadDeadline(time.Now().Add(15 * time.Second))
 				continue
@@ -407,6 +404,15 @@ func (p *PuckFS) readPacket() (err error) {
 	seqno = binary.BigEndian.Uint32(ciphertext[4:8])
 	cmd = binary.BigEndian.Uint16(plaintext[16:18])
 	p.callerSet(cmd, caller)
+	if p.sec.DEBUG {
+		pre := ""
+		sno := seqno
+		if seqno >= ackOffset {
+			sno = sno - ackOffset
+			pre = "A"
+		}
+		log.Printf("readPacket %s seqno=%s%d %s", cmdNames[cmd], pre, sno, p.packetCounters())
+	}
 	if cmd < cPartial { // Immediately process cAck, cQAck, cBye from other side.
 		if seqno < ackOffset {
 			log.Fatal("can't happen; acks have high seqno")
@@ -418,9 +424,6 @@ func (p *PuckFS) readPacket() (err error) {
 			p.rcvAck = seqno
 		}
 		ack := binary.BigEndian.Uint32(plaintext[18:22])
-		if p.sec.DEBUG {
-			log.Printf("read#%d %s ack#%d", seqno, cmdNames[cmd], ack)
-		}
 		if ack > p.snd.w {
 			log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
 			hangup(p)
@@ -453,6 +456,11 @@ func (p *PuckFS) readPacket() (err error) {
 		return
 	}
 	return
+}
+
+func (p *PuckFS) packetCounters() string {
+	return fmt.Sprintf("SW %d RW %d SA %d RA %d",
+			p.snd.w, p.rcv.w, p.sndAck, p.rcvAck)
 }
 
 // Check if oldest retransmit deadline has expired and, if so, resend.
@@ -867,6 +875,9 @@ func (p *PuckFS) HandleRPC() {
 			return
 		}
 		p.awaitEmpty()
+		if p.sec.DEBUG {
+			log.Printf("-------------")
+		}
 	}
 }
 

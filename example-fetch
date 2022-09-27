@@ -1,0 +1,75 @@
+If you're trying to get your head around the packet counting,
+here's a sample DEBUG=true run for "hotline fetch" that may
+help you check your understanding.
+SW RW SA RA refers to p.snd.w, p.rcv.w, p.sndAck, p.rcvAck
+seqno=A7 is an abbreviation for seqno=ackOffset+7
+
+
+
+puck----------------------------------------
+sendCmd Hello
+sending 54 bytes SW 6 RW 6 SA 8 RA 6
+readCmd Ack
+readPacket Ack seqno=A7 SW 7 RW 6 SA 8 RA 6
+readPacket Hello seqno=6 SW 7 RW 6 SA 8 RA 7
+Ack SW 7 RW 7 SA 9 RA 7
+-------------
+sendCmd Readdir
+sending 36 bytes SW 7 RW 7 SA 9 RA 7
+readCmd Ack
+readPacket Ack seqno=A8 SW 8 RW 7 SA 9 RA 7
+readPacket Readdir seqno=7 SW 8 RW 7 SA 9 RA 8
+Ack SW 8 RW 8 SA 10 RA 8
+-------------
+sendCmd Readfile
+sending 39 bytes SW 8 RW 8 SA 10 RA 8
+readCmd Ack
+readPacket Ack seqno=A9 SW 9 RW 8 SA 10 RA 8
+readPacket Readfile seqno=8 SW 9 RW 8 SA 10 RA 9
+Ack SW 9 RW 9 SA 11 RA 9
+-------------
+sendCmd Remove
+sending 39 bytes SW 9 RW 9 SA 11 RA 9
+readCmd Ack
+readPacket Ack seqno=A10 SW 10 RW 9 SA 11 RA 9
+readPacket Remove seqno=9 SW 10 RW 9 SA 11 RA 10
+Ack SW 10 RW 10 SA 12 RA 10
+-------------
+Bye SW 10 RW 10 SA 13 RA 10
+
+
+
+broker-------------------------------------------
+2022/09/27 02:41:36 readCmd Ack
+readPacket Hello seqno=6 SW 6 RW 6 SA 6 RA 8
+Ack SW 6 RW 7 SA 7 RA 8
+sendCmd Hello
+sending 34 bytes SW 6 RW 7 SA 7 RA 8
+readPacket Ack seqno=A9 SW 7 RW 7 SA 7 RA 8
+-------------
+readCmd Ack
+readPacket Readdir seqno=7 SW 7 RW 7 SA 7 RA 9
+Ack SW 7 RW 8 SA 8 RA 9
+sendCmd Readdir
+sending 52 bytes SW 7 RW 8 SA 8 RA 9
+readPacket Ack seqno=A10 SW 8 RW 8 SA 8 RA 9
+-------------
+readCmd Ack
+readPacket Readfile seqno=8 SW 8 RW 8 SA 8 RA 10
+Ack SW 8 RW 9 SA 9 RA 10
+sendCmd Readfile
+sending 135 bytes SW 8 RW 9 SA 9 RA 10
+readPacket Ack seqno=A11 SW 9 RW 9 SA 9 RA 10
+-------------
+readCmd Ack
+readPacket Remove seqno=9 SW 9 RW 9 SA 9 RA 11
+Ack SW 9 RW 10 SA 10 RA 11
+sendCmd Remove
+sending 34 bytes SW 9 RW 10 SA 10 RA 11
+readPacket Ack seqno=A12 SW 10 RW 10 SA 10 RA 11
+-------------
+readCmd Ack
+readPacket Bye seqno=A13 SW 10 RW 10 SA 10 RA 12
+hangup
+will retry; readCmd err Bye
+readCmd Ack

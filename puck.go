@@ -1,16 +1,26 @@
-// Copyright (c) 2020 Eric Grosse n2vi.com/0BSD
+// Copyright (c) 2020,2022 Eric Grosse n2vi.com/0BSD
 
 /*
-	Command puck implements hotline cryptography.
-	This version implements a command line interface, which I use with the
-	acme editor as GUI.
+	Command hotline implements hotline cryptography.
+	This version implements a command line interface,
+	which I use with the acme editor as GUI.
 
 	A message is delivered by writing files named "recipient/keycount"
 	on the sender's broker via the "puckfs" network protocol. In theory,
 	that broker would have a set of heuristics for how to deliver to the
 	recipient's broker through the high-resilience ROCCS network,
-	though in our current demonstration system that is merely
-	moving the message file from one directory to another.
+	though in our current simulator that is merely moving the (end-to-
+	end encrypted) message file from one directory to another.
+
+	If you're a fellow hotline developer, I will have already emailed you
+	a "puck-secret" file to install in your puck working directory to talk to
+	the broker/ROCCS-simulator that I run. Go install the hotline
+	executable. Then:
+		echo '{"Me": randomintIemailedyou, "Peers": []}' > PrincipalsDB
+		echo '{}' > keyCount
+		mkdir archiveDB; chmod go-rw PrincipalsDB archiveDB
+		hotline introduction 1446134797 eric
+		hotline rekey eric randomstringIEmailedandSignaledyou
 
 	Just working out ideas here; don't consider this final.
 	Comments welcome to grosse@gmail.com.
@@ -613,6 +623,8 @@ func main2() (err error){
 			}
 			if mess, err = validateMessage(data); err != nil {
 				return fmt.Errorf("unable to validate mess: %s", err)
+				// TODO report and skip, or maybe also delete from broker
+				//    But for now, we want to study each case and deal with it manually.
 			}
 			// TODO skip duplicates
 			// TODO split out JPEG indirect
@@ -724,6 +736,7 @@ func main2() (err error){
 		sum := sha512.Sum384(b)
 		p.My.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.My.KeyAlg = AES256GCMkeyalg
+		p.My.Secret = make([]byte, 32)
 		copy(p.My.Secret, sum[4:36])
 		// Their.Key
 		binary.BigEndian.PutUint32(b[0:], uint32(p.Id))
@@ -731,6 +744,7 @@ func main2() (err error){
 		sum = sha512.Sum384(b)
 		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.Their.KeyAlg = AES256GCMkeyalg
+		p.Their.Secret = make([]byte, 32)
 		copy(p.Their.Secret, sum[4:36])
 		err = saveDB()
 	case "s", "send":
