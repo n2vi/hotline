@@ -42,6 +42,7 @@ import (
 	"log"
 	"math"
 	"os"
+	"os/signal"
 	"path"
 	"strconv"
 	"strings"
@@ -94,7 +95,7 @@ var nickP map[string]*Principal
 var keyCount map[uint32]uint32
 var Messages []Message
 var MessageCounter int
-var broker *PuckFS
+var puckfs *PuckFS
 
 // Send to (nicks) the (text) of form (msgtype), interpreting as filename if (indirect).
 // Return the Message struct or error.
@@ -171,11 +172,11 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 		keyCount[r.My.KeyID] = keyCount[r.My.KeyID] + uint32(n)
 		file := fmt.Sprintf("%s/%08x", nicks[i], keyCount[r.My.KeyID])
 		nonce = append(nonce, ciphertext...)
-		if broker != nil {
-			if broker.sec.DEBUG {
+		if puckfs != nil {
+			if puckfs.sec.DEBUG {
 				fmt.Printf("WriteFile %s\n", file)
 			}
-			if err = broker.WriteFile(file, nonce); err != nil {
+			if err = puckfs.WriteFile(file, nonce); err != nil {
 				return m, fmt.Errorf("failed delivery to %s: %s", nicks[i], err)
 			}
 		}
@@ -345,7 +346,6 @@ func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
 
 // At command startup, load all the messages.
 // Decrypted messages are locally stored as individual files "m/aa/bb".
-// TODO return err
 func readMessages() {
 	md, err := ioutil.ReadDir("m")
 	if err != nil || len(md) < 1 {
@@ -444,8 +444,6 @@ func storeMessage(mess Message) error {
 	}
 	return nil
 }
-
-// TODO  We need a parallel set of structs and files for recording acks.
 
 func random() uint32 {
 	var buf [4]byte
@@ -605,12 +603,22 @@ func main2() (err error){
 	defer brokerClose()
 
 	switch os.Args[1] {
+	case "broker-key": // new puck - broker key, an expert-level tool for prototype puck setup
+		id := (random() & 0x00fffffe) | (puckfsVERSION << 24)
+		sec := &secretFile{false, 0, 0, 1200, id, Keygen(), ":9901"}
+		if data, err = json.MarshalIndent(sec, "", "\t"); err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		data = append(data, '\n')
+		if _, err = fmt.Printf("%s\n", data); err != nil {
+			return fmt.Errorf("%v", err)
+		}
 	case "f", "fetch": // Retrieve any pending traffic from broker.
 		var fi []fs.FileInfo
 		var mess Message
 		initialLoad()
 		brokerOpen()
-		if fi, err = broker.ReadDir("in"); err != nil {
+		if fi, err = puckfs.ReadDir("in"); err != nil {
 			return fmt.Errorf("broker: in: %v", err)
 		}
 		for _, file := range fi {
@@ -618,21 +626,21 @@ func main2() (err error){
 			if file.IsDir() {
 				return fmt.Errorf("unexpected directory in/%s", fn)
 			}
-			if data, err = broker.ReadFile("in/"+fn); err != nil {
+			if data, err = puckfs.ReadFile("in/"+fn); err != nil {
 				return fmt.Errorf("read err on message: %v", err)
 			}
 			if mess, err = validateMessage(data); err != nil {
 				return fmt.Errorf("unable to validate mess: %s", err)
-				// TODO report and skip, or maybe also delete from broker
+				// Eventually, report and skip, maybe also delete from broker.
 				//    But for now, we want to study each case and deal with it manually.
 			}
 			// TODO skip duplicates
-			// TODO split out JPEG indirect
+			// TODO split out image or other indirect
 			Messages = append(Messages, mess)
 			if err = storeMessage(mess); err != nil {
 				return fmt.Errorf("storeMessage failed: %s", err)
 			}
-			if err = broker.Remove("in/"+fn); err != nil {
+			if err = puckfs.Remove("in/"+fn); err != nil {
 				return fmt.Errorf("unable to remove in/%s: %s", fn, err)
 			}
 		}
@@ -663,16 +671,6 @@ func main2() (err error){
 		nickP[p.Nick] = &p
 		err = saveDB()
 		// next step will be face-to-face "rekey" to overwrite the random values
-	case "keygen": // new puck - broker pair, an expert-level tool for prototype puck setup
-		id := (random() & 0x00fffffe) | (puckfsVERSION << 24)
-		sec := &secretFile{false, 0, 0, 0, 0, "127.0.0.1:9901", 1000, id, Keygen()}
-		if data, err = json.MarshalIndent(sec, "", "\t"); err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		data = append(data, '\n')
-		if _, err = fmt.Printf("%s\n", data); err != nil {
-			return fmt.Errorf("%v", err)
-		}
 	case "l", "list": // Show all saved messages, sent or received.
 		initialLoad()
 		for _, msg := range Messages {
@@ -698,24 +696,31 @@ func main2() (err error){
 		}
 	case "puckfs-share":
 		// This is for prototype testing only. The real puckfs server is part of broker, not puck.
-		var p *PuckFS
 		if len(os.Args) < 3 {
 			return errors.New("usage: hotline puckfs-share dir")
 		}
-		if p, err = Listen("broker-secret"); err != nil {
+		if puckfs, err = Listen("broker-secret"); err != nil {
 			return fmt.Errorf("Listen with broker-secret: %v", err)
 		}
 		if err = os.Chdir(os.Args[2]); err != nil {
 			return fmt.Errorf("chdir %s: %v", os.Args[2], err)
 		}
 		// TODO  unveil(".","rwc")
-		p.HandleRPC()
+		chanSignal := make(chan os.Signal, 1)
+		signal.Notify(chanSignal, os.Interrupt)
+		go func() {
+			sighandler( <-chanSignal )
+		}()
+		puckfs.HandleRPC()
+		// puckfs = nil // TODO not needed?
+		log.Fatal("broker shutting down")
 	case "rekey":
 		// This is an experiment in how to set or reset the keys for a pair of
 		// principals. It has the advantage that the Puck never needs to listen
 		// on a port, unlike face-to-face ethernet. But it is not a general solution
 		// because random strings are awkward to type and not really random
 		// and the system is specific to AES keylength.
+		// TODO Rekey should also reset snd.w, rcv.w in *-secret.
 		initialLoad()
 		if len(os.Args) != 4 {
 			return errors.New("usage: hotline rekey eric 'random string'")
@@ -794,19 +799,30 @@ func saveDB() (err error){
 	return
 }
 
+func sighandler(sig os.Signal) {
+	if sig == syscall.SIGINT {
+		// This has a data race, but usually gets manually invoked during a quiet time.
+		writeSecretFile(puckfs)
+		log.Fatalf("caught %s; tried to save packet counters", sig)
+	} else {
+		log.Printf("ignoring signal %s", sig)
+	}
+}
+
 func brokerOpen() {
 	var err error
-	if broker != nil {
+	if puckfs != nil {
 		return
 	}
-	if broker, err = Dial("puck-secret"); err != nil {
-		log.Fatalf("unable to Dial broker: %v", err)
+	if puckfs, err = Dial("puck-secret"); err != nil {
+		log.Fatalf("unable to Dial broker: %s", err)
 	}
 }
 
 func brokerClose() {
-	if broker != nil {
-		broker.Close()
-		broker = nil
+	if puckfs != nil {
+		puckfs.Close()
+		puckfs = nil
 	}
 }
+

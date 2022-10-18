@@ -28,30 +28,24 @@ import (
 type secretFile struct {
 	DEBUG          bool
 	SndW, RcvW     uint32 // packet sequence numbers this side sent or is awaiting
-	SndAck, RcvAck uint32 // high water marks
-	ServerAddr     string // host:port on network "udp"
-	MTU            uint32    // conservative upper bound on msg that does not fragment
+	MTU            int    // largest payload size we will send
 	KeyID          uint32 // unique to (client,server)-pair
 	Secret         string // "ascon80pq:"+base64.StdEncoding.EncodeToString(secret)
+	ServerAddr     string // host:port on network "udp"
 }
 
 // PuckFS holds the parsed secretFile and ring buffers for the network connection.
 type PuckFS struct {
-	snd, rcv       ringBuf // packets unack'd, undeliv'd
-	sndAck, rcvAck uint32  // high water marks
-	caller         *net.UDPAddr
-	udp            *net.UDPConn // handle for reading and writing packets
-	mtu            uint32
+	snd            ringBuf // unack'd packets   snd.val=ciphertext including nonce
+	rcv            ringBuf // undeliv'd packets   rcv.val=plaintext cmd+data
+	mtu            int // largest payload size we will send
 	keyID          uint32
 	secret         []byte // base64.StdEncoding.DecodeString(Secret[10:])
 	sec            *secretFile
 	secretF       *os.File // "puck-secret" or "broker-secret", held to enable unveil() someday
+	caller         *net.UDPAddr // for client, caller==nil; for server, init &unsetCaller
+	udp            *net.UDPConn // handle for reading and writing packets
 }
-
-// Auxiliary routing information in PuckFS is currently just caller and mtu.
-//	in a client, caller=nil;
-//	in a fresh server instance, caller=&unsetCaller;
-//	in an active server, caller=address of client.
 
 // The client API follows; the server API is at the bottom of the file.
 
@@ -152,11 +146,31 @@ var TimeToRekey = errors.New("puckfs: secret is becoming stale; time to rekey!")
 
 // Close saves sequence numbers and returns TimeToRekey if secret is due for refresh.
 func (p *PuckFS) Close() (err error) {
-	p.sendAck(cBye)
-	writeSecretFile(p)
-	err = p.udp.Close()
+	if p.sec.DEBUG {
+		log.Printf("Close")
+	}
+	if p.caller == nil { // client drops the network call
+		cmd, mess := p.clientRPC(cBye, []byte{})
+		if expect(cBye, cmd, mess) != nil {
+			log.Print("may have had trouble saying Bye")
+		}
+		_ = p.udp.Close()
+		p.udp = nil
+	} else { // server keeps listening
+		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
+		p.snd.pop() // We won't be getting an ack for the Bye, but pretend we did.
+		p.caller = &unsetCaller
+	}
 	if (p.snd.w+p.rcv.w)*uint32(p.mtu) >= maxKeyCount {
-		err = TimeToRekey // This is the more critical error to return.
+		err = TimeToRekey
+		log.Print("%s", err) // Just in case caller ignores this critical err.
+	}
+	writeSecretFile(p)
+	if !p.snd.empty() || !p.rcv.empty() {
+		log.Print("Buffers not empty. Check file *-secret on puck and broker!!!")
+		// discard any pending packets
+		p.snd.r = p.snd.w
+		p.rcv.r = p.rcv.w
 	}
 	return
 }
@@ -170,23 +184,35 @@ func Keygen() string {
 	return "ascon80pq:"+base64.StdEncoding.EncodeToString(r)
 }
 
+func expect(wanted, got uint16, data []byte) (err error) {
+	if wanted == got {
+		return nil
+	}
+	if got == cError {
+		return fmt.Errorf("server declined call %v", data)
+	}
+	return fmt.Errorf("server returned %x, we expected %x", got, wanted)
+}
+
 // ------ The client API ends here. For server API, see functions at bottom of file. ------
 // Here are the network and crypto internal mechanisms. For context,
 // first read the "Hotline Networking" doc at github.com/n2vi/hotline/.
 // A sketch of packets as encoded on the wire:
-// (~40 bytes) ether, IP, UDP headers which we ignore here.
-// (16) nonce  =  (4) keyID, (4) packet sequence number, (8) random
+// (~40 bytes) ether, IP, UDP header bytes which we ignore.
+// (16) nonce  =  (4) keyID, (4) this packet sequence number, (8) random
+// (4) ack, ASCON-enciphered
 // (2) cmd, ASCON-enciphered
 // (n) data, ASCON-enciphered
 // (16) authentication tag; if ASCON-decrypt fails, packet is discarded.
-// cmd == Partial means data is to be concatenated with the following packet.
-// We do not intend to support any version negotiation.
-// Possibly we should use pure text rather than a binary format like this, but
-// don't want protocol compilers, JIT, reflection, or large parsers. Even JSON on
-// the network is a poor spec, as studies show conflicting implementations.
 //
-// Someday clients may be mobile, so perhaps best identified by keyID, with
-// IP addr regarded as a hint of where to reply. But leave that for later.
+// Packet sequence numbers, "seqno", are independent for sender and receiver,
+// and we rekey long before the integer overflow of uint32.
+// Seqno start at 0 and increment by 1, even across program restarts.
+// Yes, this implies we need to take care saving the counter.
+// It is not a catastrophic failure if we miss, but let's try hard not to.
+// There is not enough cryptographic research yet to say how often we
+// need to rekey with ascon80pq. We conjecture that limiting the number
+// of encrypted bytes to maxKeyCount is safe.
 //
 // The first byte of keyID (which is the high order byte since we adopt
 // BigEndian network byte order) is also used as a protocol version number
@@ -194,49 +220,46 @@ func Keygen() string {
 // keys as well as software. A client keyID has low bit zero and the matching
 // server keyID has low bit one, ensuring that keyID+seqno is unique
 // and preventing packet replay confusion between client and server.
-// Client and server are actually using the same encryption key.
+// After clearing that bit, client and server are using the same encryption key.
 //
-// Packets with cmd < Partial are ephemeral, not added to ring buffers
-// and hence no automatic retransmission if lost, but still authenticated.
-// We do need monotonic seqno for them, distinct from normal commands,
-// so add ackOffset before stuffing into packet.
-// These ack values are the sender's rcv.w, which is the packet
-// sequence number the sender is awaiting, one higher than the number
-// most recently accepted. That value is 0 if nothing received yet.
+// The ack value is the packet sender's rcv.w, which is the seqno
+// the sender is awaiting from the other side, one higher
+// than most recently received and validated. That value is 0 if
+// nothing has been received yet.
 //
-// Packet sequence numbers start at 0 and increment by 1, even across
-// program restarts. Yes, this implies we need to take care saving the counter.
-// It is not a catastrophic failure if we miss, but let's try hard not to.
-// There is not enough cryptographic research yet to say how often we
-// need to rekey with ascon80pq. We conjecture that limiting the number
-// of encrypted bytes to maxKeyCount is safe. This leaves plenty of
-// room so sequence numbers never collide.
+// cmd == Partial means data is to be concatenated with the following packet.
+//
+// We do not intend to support any version negotiation.
+// Possibly we should use pure text rather than a binary format like this, but
+// don't want protocol compilers, JIT, reflection, or large parsers.
+//
+// Someday clients may be mobile, so perhaps best identified by keyID, with
+// IP addr regarded as a hint of where to reply. But leave that for later.
 //
 // We assume a reasonably low latency, low error network. The timeouts in
-// readPacket() are intended to recover from rare glitches. If they fire
+// readPacket are intended to recover from rare glitches. If they fire
 // frequently, it is likely time to redesign.
 
 const (
-	cAck uint16 = iota
-	cQAck
+	puckfsVERSION = 1
+	maxKeyCount   = 1<<28
+	maxPayload = 1500 // Largest mtu that the other side might have chosen.
+	ringN = 1<<12 // max cmd payload < mtu*ringN
+)
+
+const (
+	cPartial uint16 = iota
+	cError
 	cBye
-	cPartial
 	cHello
 	cReadfile
 	cWritefile
 	cRemove
 	cReaddir
 	cChtime
-	cError
 )
-var cmdNames = []string{"Ack", "QAck", "Bye", "Partial", "Hello", "Readfile",
-	"Writefile", "Remove", "Readdir", "Chtime", "Error"}
-const (
-	puckfsVERSION = 0
-	maxKeyCount   = 0x20000000
-	ackOffset     = 0x40000000
-)
-
+var cmdNames = []string{"Partial", "Error", "Bye", "Hello", "Readfile",
+	"Writefile", "Remove", "Readdir", "Chtime"}
 var unsetCaller net.UDPAddr
 var errBye = errors.New("Bye")       // treat like network disconnect
 var sendTimeout = time.Duration(5e9) // 5 sec
@@ -259,24 +282,18 @@ func (p *PuckFS) clientRPC(scmd uint16, req []byte) (rcmd uint16, resp []byte) {
 	return
 }
 
-func expect(wanted, got uint16, data []byte) (err error) {
-	if wanted == got {
-		return nil
-	}
-	if got == cError {
-		return fmt.Errorf("server declined call %v", data)
-	}
-	return fmt.Errorf("server returned %x, we expected %x", got, wanted)
-}
-
 // Send a command, if necessary as multiple packets.
 func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 	if p.sec.DEBUG {
-		log.Printf("sendCmd %s", cmdNames[cmd])
+		log.Printf("sendCmd %s[%d] seqno=%d", cmdNames[cmd], len(data), p.snd.w)
+	}
+	if len(data) > p.mtu * ringN / 2 {
+		log.Printf("implausibly large transfer size %d, likely to fail or hang", len(data))
 	}
 	for {
 		for p.snd.full() {
 			if err = p.readPacket(); err != nil {
+				log.Printf("sendCmd %s can't push any more; giving up!!!", cmdNames[cmd])
 				return
 			}
 		}
@@ -284,12 +301,12 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 		plaintext, data = p.marshal(cmd, data)
 		ciphertext := make([]byte, len(plaintext)+16) // add room for auth tag
 		asconEncrypt(ciphertext, plaintext, []byte{}, p.secret)
-		if p.sec.DEBUG {
-			log.Printf("sending %d bytes %s", len(ciphertext), p.packetCounters())
-		}
 		p.write(ciphertext)
 		if ok := p.snd.push(ciphertext, time.Now().Add(sendTimeout)); !ok {
 			log.Fatal("can't happen; send ring buffer overflow") // we checked above
+		}
+		if p.sec.DEBUG {
+			log.Printf("  put {%d} %s", len(plaintext)-22, p.packetCounters())
 		}
 		if len(data) == 0 {
 			break
@@ -299,58 +316,31 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 }
 
 // Read an RPC request or response.
-func (p *PuckFS) readCmd() (cmd uint16, r []byte, err error) {
-	if p.sec.DEBUG {
-		log.Printf("readCmd %s", cmdNames[cmd])
-	}
-	r = make([]byte, 0)
-	var data []byte
+func (p *PuckFS) readCmd() (cmd uint16, data []byte, err error) {
+	data = make([]byte, 0)
+	var sav []byte // cmd+data from one ringBuf entry
 	var ok bool
-	var packetCount int
 	for cmd = cPartial; cmd == cPartial; {
 		for p.rcv.empty() {
 			if err = p.readPacket(); err != nil {
 				return
 			}
 		}
-		if data, ok = p.rcv.pop(); !ok {
+		if sav, ok = p.rcv.pop(); !ok {
 			log.Fatal("can't happen; pop fail on nonempty ring?")
 		}
-		if cmd = binary.BigEndian.Uint16(data[:2]); cmd < cPartial {
-			log.Fatal("can't happen: no acks in ring buffer")
-		}
-		r = append(r, data[2:]...)
-		packetCount++
-		if packetCount%(ringN/2) == 0 {
-			p.sendAck(cAck)
+		cmd = binary.BigEndian.Uint16(sav[:2])
+		data = append(data, sav[2:]...)
+		if p.sec.DEBUG {
+			log.Printf("  got {%d} %s", len(sav)-2, p.packetCounters())
 		}
 	}
-	if packetCount%(ringN/2) != 0 { // avoid duplicate Ack
-		p.sendAck(cAck)
+	if p.sec.DEBUG {
+		log.Printf("readCmd %s[%d]", cmdNames[cmd], len(data))
 	}
 	return
 }
 
-// SendAck signals progress using a separate packet.
-func (p *PuckFS) sendAck(cmd uint16) {
-	if p.caller == &unsetCaller {
-		return // If server hasn't seen an authenticated packet yet, then no place to send to.
-	}
-	msg := make([]byte, 4)
-	binary.BigEndian.PutUint32(msg, p.rcv.w) // packet seqno we are awaiting
-	plaintext, msg := p.marshal(cmd, msg)
-	if len(msg) != 0 {
-		log.Fatalf("can't happen; acks are too short to fragment %d %v", cmd, msg)
-	}
-	ciphertext := make([]byte, len(plaintext)+16)
-	asconEncrypt(ciphertext, plaintext, []byte{}, p.secret)
-	if p.sec.DEBUG {
-		log.Printf("%s %s", cmdNames[cmd], p.packetCounters())
-	}
-	p.write(ciphertext)
-}
-
-// TODO Return err.
 func (p *PuckFS) awaitEmpty() {
 	var err error
 	for !p.snd.empty() {
@@ -364,103 +354,82 @@ func (p *PuckFS) awaitEmpty() {
 	}
 }
 
-// Read a packet from network with decryption and initial processing:
-// If Ack, QAck or Bye, handle and return.
-// If partial or complete, push cmd+data onto p.rcv and return.
-// If timeout, keep trying forever.
+// Read a packet from network, validate, and push onto rcv buffer.
 func (p *PuckFS) readPacket() (err error) {
 	var caller *net.UDPAddr
 	var seqno uint32
+	var ack uint32
 	var cmd uint16
-	ciphertext := make([]byte, p.mtu+32) // last 16 bytes is the auth tag
-	plaintext := make([]byte, p.mtu+16)
-	p.udp.SetReadDeadline(time.Now().Add(3 * time.Second))
-	for { // keep reading and QAcking until we get a valid packet
+	ciphertext := make([]byte, maxPayload)
+	plaintext := make([]byte, maxPayload-16) //  Auth tag is included in ciphertext but not in plaintext.
+
+	p.udp.SetReadDeadline(time.Now().Add(5 * time.Second))
+	retry := 0
+	for {
+		retry++
 		if ciphertext, caller, err = p.read(ciphertext); err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
-				// log.Printf("deadline exceeded")
-				p.sendAck(cQAck)
+				if p.sec.DEBUG {
+					log.Printf("deadline")
+				}
+				p.retransmit()
 				p.udp.SetReadDeadline(time.Now().Add(15 * time.Second))
 				continue
 			}
 			p.udp.SetReadDeadline(noDeadline)
-			log.Printf("readPacket giving up; network read error %s", err)
-			return // some kind of network error; give up
+			log.Printf("readPacket network read error %s; giving up!!!", err)
+			return
 		}
 		if binary.BigEndian.Uint32(ciphertext[:4]) != p.keyID^1 {
-			log.Printf("wrong keyID %d, expected %d",
+			log.Printf("wrong keyID %d, expected %d!!!",
 				binary.BigEndian.Uint32(ciphertext[:4]), p.keyID^1)
-			continue // Ignore packets with wrong keyID.
+			if retry < 2 {
+				continue // Ignore one packet with wrong keyID.
+			}
+			return // configuration error or DoS attack; give up
 		}
 		n := len(ciphertext)
 		plaintext = plaintext[:n-16]
 		if err = asconDecrypt(plaintext, ciphertext, []byte{}, p.secret); err != nil {
-			log.Printf("decryption failed %s", err)
-			continue // Ignore corrupted or forged packets.
+			log.Printf("decryption failed %s; giving up!!!", err)
+			return
 		}
 		break
 	}
 	p.udp.SetReadDeadline(noDeadline)
-	seqno = binary.BigEndian.Uint32(ciphertext[4:8])
-	cmd = binary.BigEndian.Uint16(plaintext[16:18])
+	seqno = binary.BigEndian.Uint32(plaintext[4:8])
+	ack = binary.BigEndian.Uint32(plaintext[16:20])
+	cmd = binary.BigEndian.Uint16(plaintext[20:22])
 	p.callerSet(cmd, caller)
 	if p.sec.DEBUG {
-		pre := ""
-		sno := seqno
-		if seqno >= ackOffset {
-			sno = sno - ackOffset
-			pre = "A"
-		}
-		log.Printf("readPacket %s seqno=%s%d %s", cmdNames[cmd], pre, sno, p.packetCounters())
+		log.Printf("    readPacket seqno=%d ack=%d %s[%d]", seqno, ack, cmdNames[cmd], len(plaintext)-22)
 	}
-	if cmd < cPartial { // Immediately process cAck, cQAck, cBye from other side.
-		if seqno < ackOffset {
-			log.Fatal("can't happen; acks have high seqno")
-		}
-		seqno = seqno - ackOffset
-		if seqno <= p.rcvAck {
-			return // Ignore replay of acks.
-		} else {
-			p.rcvAck = seqno
-		}
-		ack := binary.BigEndian.Uint32(plaintext[18:22])
-		if ack > p.snd.w {
-			log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
-			hangup(p)
+	if ack > p.snd.w {
+		log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
+		p.Close()
+		return errBye
+	}
+	for ack > p.snd.r { // Release acknowledged packets.
+		if _, ok := p.snd.pop(); !ok {
+			log.Printf("can't happen %d %d %d", ack, p.snd.r, p.snd.w)
+			p.Close()
 			return errBye
 		}
-		for ack > p.snd.r { // Release acknowledged packets.
-			if _, ok := p.snd.pop(); !ok {
-				log.Printf("can't happen %d %d %d", ack, p.snd.r, p.snd.w)
-				hangup(p)
-				return errBye
-			}
-		}
-		if cmd == cQAck {
-			p.sendAck(cAck)
-		} else if cmd == cBye { // A motion to adjourn is always in order.
-			hangup(p)
-			return errBye
-		}
-		// Done processing acks. Take the opportunity to check retransmission timers.
-		p.retransmit()
-		return
 	}
+	p.retransmit() // Check retransmission timers.
 	if seqno != p.rcv.w { // Ignore this out-of-sequence packet.
-		// TODO Introduce a command asking to retransmit? Measure first.
+		log.Printf("dropping out-of-sequence packet %d %s", seqno, p.packetCounters())
 		return
 	}
-	if ok := p.rcv.push(plaintext[16:], noDeadline); !ok { // Ignore if we don't have room to save.
-		// Shouldn't happen; other side should wait for acks before sending this many.
-		// TODO At least have a counter here and report at close if nonzero.
+	if ok := p.rcv.push(plaintext[20:], noDeadline); !ok { // Ignore if we don't have room to save.
+		log.Printf("Shouldn't happen; other side should wait for acks before sending this many. %d %s", seqno, p.packetCounters())
 		return
 	}
 	return
 }
 
 func (p *PuckFS) packetCounters() string {
-	return fmt.Sprintf("SW %d RW %d SA %d RA %d",
-			p.snd.w, p.rcv.w, p.sndAck, p.rcvAck)
+	return fmt.Sprintf("next %d pend %d await %d", p.snd.w, p.snd.w-p.snd.r, p.rcv.w)
 }
 
 // Check if oldest retransmit deadline has expired and, if so, resend.
@@ -468,7 +437,7 @@ func (p *PuckFS) retransmit() {
 	old, t, expired := p.snd.timeout()
 	if expired {
 		if p.sec.DEBUG {
-			log.Printf("retransmit [snd.r=%d]", p.snd.r)
+			log.Printf("retransmit seqno=%d", p.snd.r)
 		}
 		p.write(old)
 		*t = time.Now().Add(sendTimeout)
@@ -480,7 +449,7 @@ func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 	var err error
 	var n int
 	var caller *net.UDPAddr
-	ciphertext = ciphertext[:p.mtu+32] // undo any previous trimming
+	ciphertext = ciphertext[:maxPayload] // undo any previous trimming
 	if p.caller == nil {
 		n, err = p.udp.Read(ciphertext)
 	} else {
@@ -490,7 +459,7 @@ func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 	if err != nil {
 		return ciphertext, caller, err
 	}
-	if n < 32 {
+	if n < 38 {
 		log.Printf("short packet with no err (%d) %v", n, ciphertext)
 		err = errors.New("short packet")
 	}
@@ -498,7 +467,6 @@ func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 }
 
 // Write a packet to the network.
-// TODO Return err.
 func (p *PuckFS) write(ciphertext []byte) {
 	var err error
 	var nw int
@@ -511,16 +479,15 @@ func (p *PuckFS) write(ciphertext []byte) {
 		log.Fatalf("short write; got %d, wanted %d", nw, len(ciphertext))
 	}
 	if err != nil {
-		log.Fatalf("udp.Write %s", err)
-		// TODO Perhaps this doesn't have to be fatal until several failures?
+		log.Fatalf("can't happen? udp.Write %s", err)
 	}
 }
 
 // If server receives a validated cHello, remember caller's address.
-// TODO Return err.
 func (p *PuckFS) callerSet(cmd uint16, caller *net.UDPAddr) {
 	if p.caller == nil {
-		return // client already knows server's address
+		 // If nil, we're a client. And we already know the server's address.
+		return
 	}
 	if cmd != cHello {
 		return // callerSet is only relevant for first packet of connection from client.
@@ -531,24 +498,15 @@ func (p *PuckFS) callerSet(cmd uint16, caller *net.UDPAddr) {
 		log.Fatal("Perhaps our earlier cHello reply to the client was lost? Unable to recover.")
 	} else {
 		log.Printf("cHello while still listening for a client that didn't Bye.")
-		hangup(p) // assume the old client crashed and let's try to proceed...
+		p.Close() // Let's assume the old client crashed and let's try to proceed...
 		p.caller = caller
 	}
 }
 
-// Copy (part of) msg into plaintext, prefixed by 18 bytes of nonce+cmd.
-// TODO Return err.
+// Copy (part of) msg into plaintext, prefixed by 22 bytes of nonce+ack+cmd.
 func (p *PuckFS) marshal(cmd uint16, msg []byte) (plaintext, unread []byte) {
-	plaintext = appendUint32(make([]byte, 0, p.mtu+16), p.keyID)
-	seqno := p.snd.w // this packet seqno
-	if cmd < cPartial {
-		p.sndAck++
-		if p.sndAck > maxKeyCount {
-			log.Fatal("Implausibly large number of acks.")
-		}
-		seqno = p.sndAck + ackOffset
-	}
-	plaintext = appendUint32(plaintext, seqno)
+	plaintext = appendUint32(make([]byte, 0, p.mtu), p.keyID)
+	plaintext = appendUint32(plaintext, p.snd.w) // seqno
 	var random [8]byte
 	nn, err := rand.Read(random[:])
 	if nn != 8 || err != nil {
@@ -556,11 +514,11 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (plaintext, unread []byte) {
 		log.Fatalf("can't happen; crypto rand fail: %d %s", nn, err)
 	}
 	plaintext = append(plaintext, random[:]...) // completes the 16 byte nonce
-	n := int(p.mtu - 2)
-	if len(msg) > n {
+	plaintext = appendUint32(plaintext, p.rcv.w) // ack
+	n := len(msg)
+	if n > p.mtu - len(plaintext) - 18 { // Is there room for msg and cmd and auth tag?
 		cmd = cPartial
-	} else {
-		n = len(msg)
+		n = p.mtu - len(plaintext) - 18
 	}
 	plaintext = appendUint16(plaintext, cmd)
 	plaintext = append(plaintext, msg[:n]...)
@@ -582,8 +540,8 @@ func readSecretFile(f *os.File) (addr *net.UDPAddr, p *PuckFS, err error) {
 	if sec.Secret[:10] != "ascon80pq:" {
 		return addr, p, fmt.Errorf("unsupported key type in secretfile: %s", sec.Secret[:10])
 	}
-	if (sec.SndW+sec.RcvW)*sec.MTU >= ackOffset {
-		return addr, p, fmt.Errorf("way past time to rekey; you were warned! %d", (sec.SndW+sec.RcvW)*sec.MTU)
+	if (sec.SndW+sec.RcvW)*uint32(sec.MTU) >= maxKeyCount/2 {
+		return addr, p, fmt.Errorf("way past time to rekey; you were warned! %d", (sec.SndW+sec.RcvW)*uint32(sec.MTU))
 	}
 	if addr, err = net.ResolveUDPAddr("udp", sec.ServerAddr); err != nil {
 		return addr, p, fmt.Errorf("unable to resolve udp %s %w", sec.ServerAddr, err)
@@ -594,31 +552,25 @@ func readSecretFile(f *os.File) (addr *net.UDPAddr, p *PuckFS, err error) {
 	if err != nil {
 		return addr, p, err
 	}
-	puckfs := PuckFS{snd, rcv, sec.SndAck, sec.RcvAck, nil, nil, sec.MTU, sec.KeyID, secret, &sec, f}
+	puckfs := PuckFS{snd, rcv, sec.MTU, sec.KeyID, secret, &sec, f, nil, nil}
 	return addr, &puckfs, nil
 }
 
-// TODO Return err.
 func writeSecretFile(p *PuckFS) {
-	// TODO Rekey should also reset snd.w, rcv.w, and ackCounter.
 	var data []byte
 	var err error
 	if p.snd.r != p.snd.w || p.rcv.r != p.rcv.w {
-		log.Printf("writeSecretFile snd.r,w=%d,%d rcv.r,w=%d,%d snd,rcvAck=%d,%d",
-			p.snd.r, p.snd.w, p.rcv.r, p.rcv.w, p.sndAck, p.rcvAck)
+		log.Printf("writeSecretFile snd.r,w=%d,%d rcv.r,w=%d,%d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
 	}
 	p.sec.SndW = p.snd.w
 	p.sec.RcvW = p.rcv.w
-	p.sec.SndAck = p.sndAck
-	p.sec.RcvAck = p.rcvAck
 	if data, err = json.MarshalIndent(p.sec, "", "\t"); err != nil {
 		// can't happen?
 		log.Fatalf("%v", err)
 	}
 	data = append(data, '\n')
 	if _, err = p.secretF.WriteAt(data, 0); err != nil {
-		log.Printf("snd.r,w=%d,%d rcv.r,w=%d,%d snd,rcvAck=%d,%d",
-			p.snd.r, p.snd.w, p.rcv.r, p.rcv.w, p.sndAck, p.rcvAck)
+		log.Printf("snd.r,w=%d,%d rcv.r,w=%d,%d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
 		log.Fatalf("%v", err)
 	}
 	return
@@ -675,16 +627,14 @@ func consumeUint16(b []byte) ([]byte, uint16) {
 	return b[2:], x
 }
 
-// We are using simple Go-Back-N retransmission with no out-of-order packet handling.
-// So we can use ring buffers for keeping track of unacknowleged packets and for
+// We are using crude Go-Back-N retransmission with no out-of-order packet handling,
+// so we can use ring buffers for keeping track of unacknowleged packets and for
 // keeping track of packets that have been read from the network but not yet processed.
 // This makes for simple scheduling and is good enough for our network assumptions above.
 
-const ringN = 16
-
 type ringBuf struct {
-	r, w uint32 // rekey long before these overflow
-	p    [ringN][]byte
+	r, w uint32 // seqno
+	p    [ringN][]byte // indexed by seqno mod ringN
 	t    [ringN]time.Time // timeout deadline
 }
 
@@ -711,7 +661,9 @@ func (ringBuf *ringBuf) pop() (val []byte, ok bool) {
 	if ringBuf.empty() {
 		return nil, false
 	}
-	val = ringBuf.p[ringBuf.r&(ringN-1)]
+	j := ringBuf.r&(ringN-1)
+	val = ringBuf.p[j]
+	// ringBuf.p[j] = []byte{} // for benefit of garbage collection   TODO confirm this
 	ringBuf.r++
 	return val, true
 }
@@ -749,7 +701,7 @@ func Listen(secretfile string) (p *PuckFS, err error) {
 }
 
 // HandleRPC is the server main loop for receiving packets and responding.
-// There is a single client which is single threaded, so we can handle requests sychronously.
+// Puck is a single client which is single threaded, so Broker can handle requests sychronously.
 func (p *PuckFS) HandleRPC() {
 	errCount := 0
 	for {
@@ -757,7 +709,7 @@ func (p *PuckFS) HandleRPC() {
 		if err != nil {
 			if errCount > 20 {
 				log.Printf("%v\ntoo many errors; giving up", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 			log.Printf("will retry; readCmd err %v", err)
@@ -780,7 +732,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cHello, resp); err != nil {
 				log.Printf("cHello err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 		case cReadfile:
@@ -794,7 +746,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cReadfile, resp); err != nil {
 				log.Printf("cReadfile err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 		case cWritefile:
@@ -808,7 +760,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cWritefile, resp); err != nil {
 				log.Printf("cWritefile sendCmd err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 		case cRemove:
@@ -822,7 +774,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cRemove, resp); err != nil {
 				log.Printf("cReadfile err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 		case cReaddir:
@@ -845,7 +797,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cReaddir, resp); err != nil {
 				log.Printf("cReaddir err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
 		case cChtime:
@@ -866,15 +818,20 @@ func (p *PuckFS) HandleRPC() {
 			resp = []byte{}
 			if err = p.sendCmd(cWritefile, resp); err != nil {
 				log.Printf("cWritefile sendCmd err %v", err)
-				hangup(p)
+				p.Close()
 				return
 			}
-		default: // includes case Bye:
-			p.sendAck(cBye)
-			hangup(p)
+		case cBye:
+			p.Close()
+		default:
+			log.Printf("unrecognized cmd %d; giving up", cmd)
+			p.Close()
 			return
 		}
-		p.awaitEmpty()
+		// At this point, we've sent our full reply but it may not yet have
+		// been received if there were lost packets. Our retransmit timers
+		// are still running. Also, we expect the client to soon send another
+		// command, likely Bye, including an ack.
 		if p.sec.DEBUG {
 			log.Printf("-------------")
 		}
@@ -957,17 +914,3 @@ func reject(p *PuckFS, cmd uint16, mess string) {
 	}
 }
 
-// Hangup makes a best effort to save updated counters, but no guarantee.
-// TODO Also arrange for this upon SIGHUP?
-func hangup(p *PuckFS) {
-	if p.sec.DEBUG {
-		log.Printf("hangup")
-	}
-	if p.caller == nil { // client
-		_ = p.udp.Close()
-		p.udp = nil
-	} else { // server
-		p.caller = &unsetCaller
-	}
-	writeSecretFile(p)
-}

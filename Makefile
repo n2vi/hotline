@@ -23,6 +23,7 @@ install:
 	@echo "[+] Done"
 clean:
 	rm -f hotline
+nuke: clean
 	rm -rf archiveDB
 	rm -f keyCount
 	rm -f PrincipalsDB
