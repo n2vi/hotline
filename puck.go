@@ -1,7 +1,7 @@
 // Copyright (c) 2020,2022 Eric Grosse n2vi.com/0BSD
 
 /*
-	Command hotline implements hotline cryptography.
+	Command hotline implements a simple e2e encrypted chat.
 	This version implements a command line interface,
 	which I use with the acme editor as GUI.
 
@@ -700,7 +700,7 @@ func main2() (err error){
 			return errors.New("usage: hotline puckfs-share dir")
 		}
 		if puckfs, err = Listen("broker-secret"); err != nil {
-			return fmt.Errorf("Listen with broker-secret: %v", err)
+			log.Fatalf("Listen with broker-secret: %v", err)
 		}
 		if err = os.Chdir(os.Args[2]); err != nil {
 			return fmt.Errorf("chdir %s: %v", os.Args[2], err)

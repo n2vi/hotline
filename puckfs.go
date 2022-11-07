@@ -149,14 +149,14 @@ func (p *PuckFS) Close() (err error) {
 	if p.sec.DEBUG {
 		log.Printf("Close")
 	}
-	if p.caller == nil { // client drops the network call
+	if p.caller == nil { // We're a client. Drop the network call.
 		cmd, mess := p.clientRPC(cBye, []byte{})
 		if expect(cBye, cmd, mess) != nil {
 			log.Print("may have had trouble saying Bye")
 		}
 		_ = p.udp.Close()
 		p.udp = nil
-	} else { // server keeps listening
+	} else { // We're a server. Record the call as dropped but keep listening.
 		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
 		p.snd.pop() // We won't be getting an ack for the Bye, but pretend we did.
 		p.caller = &unsetCaller
@@ -189,7 +189,7 @@ func expect(wanted, got uint16, data []byte) (err error) {
 		return nil
 	}
 	if got == cError {
-		return fmt.Errorf("server declined call %v", data)
+		return fmt.Errorf("server declined call %s", data)
 	}
 	return fmt.Errorf("server returned %x, we expected %x", got, wanted)
 }
@@ -231,7 +231,7 @@ func expect(wanted, got uint16, data []byte) (err error) {
 //
 // We do not intend to support any version negotiation.
 // Possibly we should use pure text rather than a binary format like this, but
-// don't want protocol compilers, JIT, reflection, or large parsers.
+// we don't want protocol compilers, JIT, reflection, or large parsers.
 //
 // Someday clients may be mobile, so perhaps best identified by keyID, with
 // IP addr regarded as a hint of where to reply. But leave that for later.
@@ -261,7 +261,8 @@ const (
 var cmdNames = []string{"Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir", "Chtime"}
 var unsetCaller net.UDPAddr
-var errBye = errors.New("Bye")       // treat like network disconnect
+var errBye = errors.New("errBye")       // treat like network disconnect
+var errKey = errors.New("wrongKey")
 var sendTimeout = time.Duration(5e9) // 5 sec
 var noDeadline time.Time
 
@@ -323,6 +324,7 @@ func (p *PuckFS) readCmd() (cmd uint16, data []byte, err error) {
 	for cmd = cPartial; cmd == cPartial; {
 		for p.rcv.empty() {
 			if err = p.readPacket(); err != nil {
+				log.Printf("readCmd failed %s", err)
 				return
 			}
 		}
@@ -363,7 +365,9 @@ func (p *PuckFS) readPacket() (err error) {
 	ciphertext := make([]byte, maxPayload)
 	plaintext := make([]byte, maxPayload-16) //  Auth tag is included in ciphertext but not in plaintext.
 
-	p.udp.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if !p.snd.empty() { // only useful to timeout if we have something to retransmit
+		p.udp.SetReadDeadline(time.Now().Add(5 * time.Second))
+	}
 	retry := 0
 	for {
 		retry++
@@ -373,7 +377,7 @@ func (p *PuckFS) readPacket() (err error) {
 					log.Printf("deadline")
 				}
 				p.retransmit()
-				p.udp.SetReadDeadline(time.Now().Add(15 * time.Second))
+				p.udp.SetReadDeadline(time.Now().Add(30 * time.Second))
 				continue
 			}
 			p.udp.SetReadDeadline(noDeadline)
@@ -386,7 +390,7 @@ func (p *PuckFS) readPacket() (err error) {
 			if retry < 2 {
 				continue // Ignore one packet with wrong keyID.
 			}
-			return // configuration error or DoS attack; give up
+			return errKey // configuration error or DoS attack; give up
 		}
 		n := len(ciphertext)
 		plaintext = plaintext[:n-16]
@@ -402,12 +406,11 @@ func (p *PuckFS) readPacket() (err error) {
 	cmd = binary.BigEndian.Uint16(plaintext[20:22])
 	p.callerSet(cmd, caller)
 	if p.sec.DEBUG {
-		log.Printf("    readPacket seqno=%d ack=%d %s[%d]", seqno, ack, cmdNames[cmd], len(plaintext)-22)
+		log.Printf("  readPacket seqno=%d ack=%d %s[%d]", seqno, ack, cmdNames[cmd], len(plaintext)-22)
 	}
 	if ack > p.snd.w {
 		log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
-		p.Close()
-		return errBye
+		return p.bail(seqno, ack)
 	}
 	for ack > p.snd.r { // Release acknowledged packets.
 		if _, ok := p.snd.pop(); !ok {
@@ -417,12 +420,16 @@ func (p *PuckFS) readPacket() (err error) {
 		}
 	}
 	p.retransmit() // Check retransmission timers.
-	if seqno != p.rcv.w { // Ignore this out-of-sequence packet.
+	if seqno != p.rcv.w { // Ignore out-of-sequence packets.
+		if cmd == cBye {
+			log.Printf("out-of-sequence Bye %d %s", seqno, p.packetCounters())
+			return p.bail(seqno, ack)
+		}
 		log.Printf("dropping out-of-sequence packet %d %s", seqno, p.packetCounters())
 		return
 	}
 	if ok := p.rcv.push(plaintext[20:], noDeadline); !ok { // Ignore if we don't have room to save.
-		log.Printf("Shouldn't happen; other side should wait for acks before sending this many. %d %s", seqno, p.packetCounters())
+		log.Printf("Other side should wait for acks. %d %s", seqno, p.packetCounters())
 		return
 	}
 	return
@@ -444,7 +451,7 @@ func (p *PuckFS) retransmit() {
 	}
 }
 
-// Read a packet from network.
+// Low-level read from network.
 func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 	var err error
 	var n int
@@ -466,7 +473,7 @@ func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 	return ciphertext, caller, nil
 }
 
-// Write a packet to the network.
+// Low-level write to the network.
 func (p *PuckFS) write(ciphertext []byte) {
 	var err error
 	var nw int
@@ -510,7 +517,6 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (plaintext, unread []byte) {
 	var random [8]byte
 	nn, err := rand.Read(random[:])
 	if nn != 8 || err != nil {
-		// First half of nonce is unique, so not truly fatal even if random part isn't random.
 		log.Fatalf("can't happen; crypto rand fail: %d %s", nn, err)
 	}
 	plaintext = append(plaintext, random[:]...) // completes the 16 byte nonce
@@ -523,6 +529,23 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (plaintext, unread []byte) {
 	plaintext = appendUint16(plaintext, cmd)
 	plaintext = append(plaintext, msg[:n]...)
 	return plaintext, msg[n:]
+}
+
+// Try to recover from presumed stale SecretFile.
+func (p *PuckFS) bail(seqno, ack uint32) (error){
+	log.Printf("Probably we failed earlier while saving our counters; bailing.")
+	p.snd.w = ack
+	for ok := true; ok; _, ok = p.snd.pop() {
+		// Discard until buffer is empty.
+	}
+	p.rcv.w = seqno+1
+	for ok := true; ok; _, ok = p.rcv.pop() {
+		// Discard until buffer is empty.
+	}
+	log.Printf("forced %d %d %d %d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
+	writeSecretFile(p)
+	p.Close()
+	return errBye
 }
 
 func readSecretFile(f *os.File) (addr *net.UDPAddr, p *PuckFS, err error) {
@@ -690,13 +713,13 @@ func Listen(secretfile string) (p *PuckFS, err error) {
 	if addr, p, err = readSecretFile(f); err != nil {
 		return p, err
 	}
+	p.caller = &unsetCaller
 	if p.keyID&1 != 1 { // can't happen except by catastrophic blunder
 		return p, errors.New("wanted keyID for server, got client")
 	}
 	if p.udp, err = net.ListenUDP("udp", addr); err != nil {
 		return p, err
 	}
-	p.caller = &unsetCaller
 	return
 }
 
@@ -833,7 +856,7 @@ func (p *PuckFS) HandleRPC() {
 		// are still running. Also, we expect the client to soon send another
 		// command, likely Bye, including an ack.
 		if p.sec.DEBUG {
-			log.Printf("-------------")
+			log.Printf("------------- %d", p.snd.w-p.snd.r)
 		}
 	}
 }
