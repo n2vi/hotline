@@ -543,7 +543,7 @@ func (p *PuckFS) bail(seqno, ack uint32) (error){
 		// Discard until buffer is empty.
 	}
 	log.Printf("forced %d %d %d %d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
-	writeSecretFile(p)
+	// TODO   Confirm we don't need this, because done in p.Close():   writeSecretFile(p)
 	p.Close()
 	return errBye
 }
@@ -558,7 +558,7 @@ func readSecretFile(f *os.File) (addr *net.UDPAddr, p *PuckFS, err error) {
 		return addr, p, err
 	}
 	if (sec.KeyID >> 24) != puckfsVERSION {
-		return addr, p, fmt.Errorf("KeyID ver %d, wanted %d", sec.KeyID>>24, puckfsVERSION)
+		return addr, p, fmt.Errorf("KeyID puckfsVERSION %d, wanted %d", sec.KeyID>>24, puckfsVERSION)
 	}
 	if sec.Secret[:10] != "ascon80pq:" {
 		return addr, p, fmt.Errorf("unsupported key type in secretfile: %s", sec.Secret[:10])
@@ -592,6 +592,9 @@ func writeSecretFile(p *PuckFS) {
 		log.Fatalf("%v", err)
 	}
 	data = append(data, '\n')
+	if err = p.secretF.Truncate(0); err != nil {
+		log.Printf("unable to truncate in writeSecretFile, but plunging ahead; check the result!\n")
+	}
 	if _, err = p.secretF.WriteAt(data, 0); err != nil {
 		log.Printf("snd.r,w=%d,%d rcv.r,w=%d,%d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
 		log.Fatalf("%v", err)
