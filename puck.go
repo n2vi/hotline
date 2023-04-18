@@ -194,7 +194,7 @@ func peerLookup(keyID uint32) (p *Principal, err error) {
 			return peer, nil
 		}
 	}
-	return p, fmt.Errorf("no peer found for keyID %0x", keyID)
+	return p, fmt.Errorf("no peer found for keyID %0x=%d", keyID, keyID)
 }
 
 // We received (data) which may be malicious. Either return parsed Message struct or error.

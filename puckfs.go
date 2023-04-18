@@ -163,7 +163,7 @@ func (p *PuckFS) Close() (err error) {
 	}
 	if (p.snd.w+p.rcv.w)*uint32(p.mtu) >= maxKeyCount {
 		err = TimeToRekey
-		log.Print("%s", err) // Just in case caller ignores this critical err.
+		log.Printf("%s", err) // Just in case caller ignores this critical err.
 	}
 	writeSecretFile(p)
 	if !p.snd.empty() || !p.rcv.empty() {
@@ -302,7 +302,10 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 		plaintext, data = p.marshal(cmd, data)
 		ciphertext := make([]byte, len(plaintext)+16) // add room for auth tag
 		asconEncrypt(ciphertext, plaintext, []byte{}, p.secret)
-		p.write(ciphertext)
+		err = p.write(ciphertext)
+		if err != nil {
+			return
+		}
 		if ok := p.snd.push(ciphertext, time.Now().Add(sendTimeout)); !ok {
 			log.Fatal("can't happen; send ring buffer overflow") // we checked above
 		}
@@ -446,7 +449,9 @@ func (p *PuckFS) retransmit() {
 		if p.sec.DEBUG {
 			log.Printf("retransmit seqno=%d", p.snd.r)
 		}
-		p.write(old)
+		if p.write(old) != nil {
+			return
+		}
 		*t = time.Now().Add(sendTimeout)
 	}
 }
@@ -474,8 +479,7 @@ func (p *PuckFS) read(ciphertext []byte) ([]byte, *net.UDPAddr, error) {
 }
 
 // Low-level write to the network.
-func (p *PuckFS) write(ciphertext []byte) {
-	var err error
+func (p *PuckFS) write(ciphertext []byte) (err error) {
 	var nw int
 	if p.caller == nil {
 		nw, err = p.udp.Write(ciphertext)
@@ -483,11 +487,12 @@ func (p *PuckFS) write(ciphertext []byte) {
 		nw, err = p.udp.WriteToUDP(ciphertext, p.caller)
 	}
 	if nw != len(ciphertext) {
-		log.Fatalf("short write; got %d, wanted %d", nw, len(ciphertext))
+		log.Printf("!!!  short write; got %d, wanted %d", nw, len(ciphertext))
 	}
 	if err != nil {
-		log.Fatalf("can't happen? udp.Write %s", err)
+		log.Printf("!!!  can't happen? udp.Write %s", err)
 	}
+	return
 }
 
 // If server receives a validated cHello, remember caller's address.
