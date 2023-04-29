@@ -53,6 +53,7 @@ type PuckFS struct {
 func Dial(secretfile string) (p *PuckFS, err error) {
 	var addr *net.UDPAddr
 	var f *os.File
+	log.SetFlags(log.Ldate|log.Ltime|log.Lmicroseconds)
 	if f, err = os.OpenFile(secretfile, os.O_RDWR, 0600); err != nil {
 		return p, err
 	}
@@ -407,10 +408,10 @@ func (p *PuckFS) readPacket() (err error) {
 	seqno = binary.BigEndian.Uint32(plaintext[4:8])
 	ack = binary.BigEndian.Uint32(plaintext[16:20])
 	cmd = binary.BigEndian.Uint16(plaintext[20:22])
-	p.callerSet(cmd, caller)
 	if p.sec.DEBUG {
 		log.Printf("  readPacket seqno=%d ack=%d %s[%d]", seqno, ack, cmdNames[cmd], len(plaintext)-22)
 	}
+	p.callerSet(cmd, caller)
 	if ack > p.snd.w {
 		log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
 		return p.bail(seqno, ack)
@@ -490,7 +491,7 @@ func (p *PuckFS) write(ciphertext []byte) (err error) {
 		log.Printf("!!!  short write; got %d, wanted %d", nw, len(ciphertext))
 	}
 	if err != nil {
-		log.Printf("!!!  can't happen? udp.Write %s", err)
+		log.Fatalf("!!!  can't happen? udp.Write %s", err)
 	}
 	return
 }
@@ -715,6 +716,7 @@ func (ringBuf *ringBuf) timeout() (data []byte, t *time.Time, expired bool) {
 func Listen(secretfile string) (p *PuckFS, err error) {
 	var addr *net.UDPAddr
 	var f *os.File
+	log.SetFlags(log.Ldate|log.Ltime|log.Lmicroseconds)
 	if f, err = os.OpenFile(secretfile, os.O_RDWR, 0600); err != nil {
 		return p, err
 	}
@@ -738,7 +740,7 @@ func (p *PuckFS) HandleRPC() {
 	for {
 		cmd, req, err := p.readCmd()
 		if err != nil {
-			if errCount > 20 {
+			if errCount > 3 {
 				log.Printf("%v\ntoo many errors; giving up", err)
 				p.Close()
 				return
