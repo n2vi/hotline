@@ -106,9 +106,12 @@ func (p *PuckFS) ReadDir(path string) (fi []fs.FileInfo, err error) {
 	if err = expect(cReaddir, cmd, data); err != nil {
 		return []fs.FileInfo{}, err
 	}
-	datalines := linesplit(data)
+	datalines := bytes.Split(data, []byte("\n'"))
 	fi = make([]fs.FileInfo, len(datalines))
 	for i, s := range datalines {
+		if len(s) == 0 {   // in case there is an empty after final newline?
+			continue
+		}
 		field := bytes.Split(s, []byte("\000"))
 		if len(field) != 3 {
 			return fi, errors.New("can't happen; expect dir{name,size,mtime}")
@@ -922,20 +925,6 @@ func (fi myFileInfo) IsDir() bool {
 
 func (fi myFileInfo) Sys() interface{} {
 	return nil
-}
-
-// Linesplit separates byte array at newlines.
-func linesplit(data []byte) (lines [][]byte) {
-	// lines = make([][]byte, 0, 100)
-	for len(data) > 0 {
-		j := bytes.IndexByte(data, '\n')
-		if j < 0 {
-			log.Fatal("can't happen; no trailing newline")
-		}
-		lines = append(lines, data[:j])
-		data = data[j+1:]
-	}
-	return lines
 }
 
 // Reject sends error message, else fatal.
