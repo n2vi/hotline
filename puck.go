@@ -1,69 +1,58 @@
-// Copyright (c) 2020,2022 Eric Grosse n2vi.com/0BSD
+// Copyright (c) 2020,2022,2025 Eric Grosse n2vi.com/0BSD
 
 /*
-	Command hotline implements a simple e2e encrypted chat.
-	This version implements a command line interface,
-	which I use with the acme editor as GUI.
+Command hotline implements a simple e2e encrypted chat.
+This version implements a command line interface,
+which I use with the acme editor as GUI.
 
-	A message is delivered by writing files named "recipient/keycount"
-	on the sender's broker via the "puckfs" network protocol. In theory,
-	that broker would have a set of heuristics for how to deliver to the
-	recipient's broker through the high-resilience ROCCS network,
-	though in our current simulator that is merely moving the (end-to-
-	end encrypted) message file from one directory to another.
+A message is delivered by writing files named "recipient/nanosec"
+on the sender's broker via the "puckfs" network protocol. In theory,
+that broker would have a set of heuristics for how to deliver to the
+recipient's broker through the high-resilience ROCCS network,
+though in our current simulator that is merely moving the (end-to-
+end encrypted) message file from one directory to another.
 
-	If you're a fellow hotline developer, I will have already emailed you
-	a "puck-secret" file to install in your puck working directory to talk to
-	the broker/ROCCS-simulator that I run. Go install the hotline
-	executable. Then:
-		echo '{"Me": randomintIemailedyou, "Peers": []}' > PrincipalsDB
-		echo '{}' > keyCount
-		mkdir archiveDB; chmod go-rw PrincipalsDB archiveDB
-		hotline introduction 1446134797 eric
-		hotline rekey eric randomstringIEmailedandSignaledyou
+If you're a fellow hotline developer, I will have already emailed you
+a file to install in $HOME/.ssh/.puckfs to talk to the broker/ROCCS-simulator
+that I run. Go install the hotline executable. Then:
 
-	Just working out ideas here; don't consider this final.
-	Comments welcome to grosse@gmail.com.
+	echo '{"Me": randomintyougotbymail, "Peers": []}' > PrincipalsDB
+	echo '0 0' > .puckfs
+	mkdir archiveDB; chmod go-rw PrincipalsDB archiveDB
+	hotline introduction 1446134797 eric
+	hotline rekey eric randomstringIEmailedandSignaledyou
+
+Just working out ideas here; don't consider this final.
+Comments welcome to grosse@gmail.com.
 */
 package main
 
 import (
 	"bytes"
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha512"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
-	"io/ioutil"
 	"log"
-	"math"
 	"os"
-	"os/signal"
 	"path"
+	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
-)
 
-const (
-	VERSION         = 0x484f5431 // "HOT1"
-	AES256GCMkeyalg = 1 // the default here, but expect others
+	"github.com/n2vi/hotline/puckfs"
+	"golang.org/x/crypto/chacha20poly1305"
 )
-
-type ID uint32          // static, globally-unique identifier of a principal
-type MessageType string // "UTF8", "JPEG", "ACK1", "QACK"
-var JPEGmagic [3]byte = [3]byte{0xff, 0xd8, 0xff}
-var unmatchedError = errors.New("unmatched")
 
 type PrincipalsDB struct {
 	Me    ID // my (puck's) identity
 	Peers []*Principal
 }
+type ID uint32 // static, globally-unique identifier of a principal
 
 type Principal struct {
 	Id        ID     // my peer's identity
@@ -84,26 +73,25 @@ type Message struct {
 	From     ID
 	To       []ID
 	MsgType  MessageType
-	Indirect bool // body is filename, not contents
 	Body     []byte
 	fn       string // local filename for storing the message
 }
+type MessageType string // "UTF8", "ACK1", "QACK"
 
 var db PrincipalsDB
 var nick map[ID]string
 var nickP map[string]*Principal
-var keyCount map[uint32]uint32
+var keyP map[/*KeyID*/uint32]*Principal
 var Messages []Message
 var MessageCounter int
-var puckfs *PuckFS
+var pfs *puckfs.PuckFS
+var VERSION [4]byte = [4]byte{0x48, 0x4f, 0x54, 0x33} // "HOT3"
+var unmatchedError = errors.New("unmatched")
 
-// Send to (nicks) the (text) of form (msgtype), interpreting as filename if (indirect).
+// Send to (nicks) the (text) of form (msgtype).
 // Return the Message struct or error.
-func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Message, error) {
+func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 	var m Message
-	var ovfl error
-	var err error
-
 	m.Date = time.Now().Unix()
 	m.From = db.Me
 	nr := len(nicks)
@@ -122,15 +110,8 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 	if len(msgtype) != 4 {
 		log.Fatalf("invalid MessageType %s", msgtype)
 	}
-	m.Indirect = indirect
 	m.Body = []byte(text)
 	body := m.Body
-	if indirect {
-		body, err = ioutil.ReadFile(strings.TrimSuffix(text, "\n"))
-		if err != nil {
-			log.Fatalf("unable to read %q: %s", text, err)
-		}
-	}
 
 	//    4   magic
 	//    4   msgtype
@@ -141,90 +122,54 @@ func sendTo(nicks []string, text string, msgtype MessageType, indirect bool) (Me
 	//  len  body
 	n := 22 + 4*nr + len(body)
 	plaintext := make([]byte, n)
-	binary.BigEndian.PutUint32(plaintext[0:], VERSION)
-	copy(plaintext[4:], []byte(m.MsgType))
-	binary.BigEndian.PutUint64(plaintext[8:], uint64(m.Date))
-	binary.BigEndian.PutUint32(plaintext[16:], uint32(m.From))
-	binary.BigEndian.PutUint16(plaintext[20:], uint16(nr))
+	copy(plaintext[0:4], VERSION[:])
+	copy(plaintext[4:8], []byte(m.MsgType))
+	binary.BigEndian.PutUint64(plaintext[8:16], uint64(m.Date))
+	binary.BigEndian.PutUint32(plaintext[16:20], uint32(m.From))
+	binary.BigEndian.PutUint16(plaintext[20:22], uint16(nr))
 	for i := 0; i < nr; i++ {
 		binary.BigEndian.PutUint32(plaintext[22+i*4:], uint32(m.To[i]))
 	}
 	copy(plaintext[22+4*nr:], body)
+	dst := make([]byte, 4+24+len(plaintext)+16)
 
 	for i := 0; i < nr; i++ {
 		r := nickP[nicks[i]]
-		if uint32(n) >= math.MaxUint32/4-keyCount[r.My.KeyID] {
-			ovfl = fmt.Errorf("key counter overflow for %s", r.Nick)
-		}
-		nonce := make([]byte, 12)
-		binary.BigEndian.PutUint32(nonce[0:], random())
-		binary.BigEndian.PutUint32(nonce[4:], r.My.KeyID)
-		binary.BigEndian.PutUint32(nonce[8:], keyCount[r.My.KeyID])
-		block, err := aes.NewCipher(r.My.Secret)
+		aead, err := chacha20poly1305.NewX(r.My.Secret)
 		if err != nil {
-			return m, fmt.Errorf("aes.NewCipher failed: %s", err)
+			return m, fmt.Errorf("chacha20poly1305.NewX: %s", err)
 		}
-		aesgcm, err := cipher.NewGCM(block)
-		if err != nil {
-			return m, fmt.Errorf("cipher.NewGCM failed: %s", err)
-		}
-		ciphertext := aesgcm.Seal(nil, nonce, plaintext, nil)
-		keyCount[r.My.KeyID] = keyCount[r.My.KeyID] + uint32(n)
-		file := fmt.Sprintf("%s/%08x", nicks[i], keyCount[r.My.KeyID])
-		nonce = append(nonce, ciphertext...)
-		if puckfs != nil {
-			if puckfs.sec.DEBUG {
-				fmt.Printf("WriteFile %s\n", file)
-			}
-			if err = puckfs.WriteFile(file, nonce); err != nil {
+		binary.BigEndian.PutUint32(dst[0:4], r.My.KeyID) // associatedData
+		rand.Read(dst[4:28]) // nonce
+		dst = aead.Seal(dst, dst[4:28], plaintext, dst[0:4])
+		file := fmt.Sprintf("%s/%x", nicks[i], time.Now().UnixNano())
+		if pfs != nil {
+			fmt.Printf("WriteFile %s\n", file)
+			if err = pfs.WriteFile(file, dst); err != nil {
 				return m, fmt.Errorf("failed delivery to %s: %s", nicks[i], err)
 			}
 		}
-		saveKeyCount() // somewhat wasteful but safest
 	}
-	return m, ovfl
-	// If ovfl, messages were sent but exceeded key counter limit.
-	// This is a soft fail; don't ignore it, but don't panic.
-}
-
-// We received an encrypted message with (keyID); let's figure out who it is from.
-func peerLookup(keyID uint32) (p *Principal, err error) {
-	for _, peer := range db.Peers {
-		if peer.Their.KeyID == keyID {
-			return peer, nil
-		}
-	}
-	return p, fmt.Errorf("no peer found for keyID %0x=%d", keyID, keyID)
+	return m, nil
 }
 
 // We received (data) which may be malicious. Either return parsed Message struct or error.
 func validateMessage(data []byte) (m Message, err error) {
-	var sender *Principal
-	nonce := data[:12]
-	ciphertext := data[12:]
-	var plaintext []byte
-	keyID := binary.BigEndian.Uint32(nonce[4:8])
-	if sender, err = peerLookup(keyID); err != nil {
+	keyID := binary.BigEndian.Uint32(data[0:4])
+	sender, ok := keyP[keyID]
+	if !ok {
+		return m, fmt.Errorf("no peer found for keyID %0x=%d", keyID, keyID)
+	}
+	aead, err := chacha20poly1305.NewX(sender.Their.Secret)
+	if err != nil {
+		return m, fmt.Errorf("chacha20poly1305.NewX: %s", err)
+	}
+	plaintext, err := aead.Open(nil, data[4:28], data[28:], data[0:4])
+	if err != nil {
 		return m, err
 	}
-	kc := binary.BigEndian.Uint32(nonce[8:12])
-	if kc < keyCount[keyID] {
-		log.Fatalf("keyID %0x keyCount inconsistency %d %d", keyID, kc, keyCount[keyID])
-	}
-	block, err := aes.NewCipher(sender.Their.Secret)
-	if err != nil {
-		return m, fmt.Errorf("aes.NewCipher failed: %s", err)
-	}
-	aesgcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return m, fmt.Errorf("cipher.NewGCM failed: %s", err)
-	}
-	if plaintext, err = aesgcm.Open(nil, nonce, ciphertext, nil); err != nil {
-		return m, err
-	}
-	ver := binary.BigEndian.Uint32(plaintext[0:4])
-	if ver != VERSION {
-		return m, fmt.Errorf("mismatched VERSION; got %x, want %x", ver, VERSION)
+	if !bytes.Equal(plaintext[0:4], VERSION[:]) {
+		return m, fmt.Errorf("VERSION: got %x, want %x", plaintext[0:4], VERSION)
 	}
 	m.MsgType = MessageType(plaintext[4:8])
 	m.Date = int64(binary.BigEndian.Uint64(plaintext[8:16]))
@@ -237,24 +182,21 @@ func validateMessage(data []byte) (m Message, err error) {
 	for i := 0; i < nr; i++ {
 		m.To[i] = ID(binary.BigEndian.Uint32(plaintext[22+i*4 : 26+i*4]))
 	}
-	m.Indirect = false
 	m.Body = plaintext[22+nr*4:]
 	m.fn = "unset"
-	keyCount[keyID] = kc
 	return m, nil
 }
 
-// Convert Message file contents (b) from file (fn) to Message struct.
+// Convert Message file contents (b) from local file (fn) to Message struct.
 // Message files have the following format, intended for anyone to be able to read
 // even if they have never seen any documentation or source code.
 // date nnnnnnnnnn local time including zone
 // from hhhhhhhh me
 // to hhhhhhhh Bob
 // to hhhhhhhh Carol
-// msgtype UTF8 or JPEG or whatever   (if not the default, which is UTF8)
-// indirect  (if not the default, which is that body includes message contents)
+// msgtype UTF8 or whatever   (default is UTF8)
 // {empty line}
-// {remaining bytes of file}    {or local filename if indirect}
+// {remaining bytes of file}
 func unmarshalMessage(fn string, b []byte) (Message, error) {
 	b, date, err := hdrInt64(b, "date ")
 	if err != nil {
@@ -284,34 +226,23 @@ func unmarshalMessage(fn string, b []byte) (Message, error) {
 	if err == nil {
 		typ = v
 	}
-	if typ != "UTF8" && typ != "JPEG" {
+	if typ != "UTF8" {
 		return Message{}, fmt.Errorf("unrecognized msgtype %s", typ)
-	}
-
-	indirect := false
-	b, _, err = keyval(b, "indirect")
-	if err == nil {
-		indirect = true
 	}
 
 	if len(b) == 0 || b[0] != '\n' {
 		return Message{}, fmt.Errorf("missing separating newline %s", b)
 	}
-	return Message{date, from, to, MessageType(typ), indirect, b[1:], fn}, nil
+	return Message{date, from, to, MessageType(typ), b[1:], fn}, nil
 }
 
 // parseDraft is very similar to unmarshalMessage, but for human-created input.
 // Specifically, it expects (b) of the form
-//    to nicks
 //
-//    some text
-// or perhaps
-//    to nicks
-//    msgtype JPEG
-//    indirect
+//	to nicks
 //
-//    foo.jpg
-func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
+//	some text
+func parseDraft(b []byte) ([]byte, MessageType, []string, error) {
 	var v string
 	var err error
 	nicks := make([]string, 0)
@@ -321,7 +252,7 @@ func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
 			break
 		}
 		if err != nil {
-			return nil, "", false, nil, fmt.Errorf("bad to")
+			return nil, "", nil, fmt.Errorf("bad to")
 		}
 		nicks = append(nicks, v)
 	}
@@ -330,24 +261,19 @@ func parseDraft(b []byte) ([]byte, MessageType, bool, []string, error) {
 	if err == nil {
 		typ = v
 	}
-	if typ != "UTF8" && typ != "JPEG" {
-		return nil, "", false, nil, fmt.Errorf("unrecognized msgtype %s", typ)
-	}
-	indirect := false
-	b, _, err = keyval(b, "indirect")
-	if err == nil {
-		indirect = true
+	if typ != "UTF8" {
+		return nil, "", nil, fmt.Errorf("unrecognized msgtype %s", typ)
 	}
 	if len(b) == 0 || b[0] != '\n' {
-		return nil, "", false, nil, fmt.Errorf("missing separating newline %s", b)
+		return nil, "", nil, fmt.Errorf("missing separating newline %s", b)
 	}
-	return b[1:], MessageType(typ), indirect, nicks, nil
+	return b[1:], MessageType(typ), nicks, nil
 }
 
-// At command startup, load all the messages.
-// Decrypted messages are locally stored as individual files "m/aa/bb".
+// At command startup, load all the locally-saved messages, which are stored
+// as individual cleartext files "m/aa/bb". The puck is assumed to be whole-disk encrypted.
 func readMessages() {
-	md, err := ioutil.ReadDir("m")
+	md, err := os.ReadDir("m")
 	if err != nil || len(md) < 1 {
 		log.Fatalf("missing messages directory? %d %s", len(md), err)
 	}
@@ -368,7 +294,7 @@ func readMessages() {
 			mdf = md[0].Name()
 			continue
 		}
-		b, err := ioutil.ReadFile(mf)
+		b, err := os.ReadFile(mf)
 		if os.IsNotExist(err) {
 			messno++
 			continue
@@ -384,11 +310,8 @@ func readMessages() {
 		MessageCounter = messno
 		messno++
 	}
-	if MessageCounter > 400000 {
-		log.Fatalf("past time for a new Message database!")
-	}
 	if MessageCounter > 40000 {
-		log.Printf("time for a new Message database design %d", messno)
+		log.Print("past time for a new Message database!")
 	}
 }
 
@@ -417,9 +340,6 @@ func storeMessage(mess Message) error {
 		hdr += fmt.Sprintf("to %x %s\n", t, nick[t])
 	}
 	hdr += fmt.Sprintf("msgtype %s\n", mess.MsgType)
-	if mess.Indirect {
-		hdr += fmt.Sprintf("indirect\n")
-	}
 	hdr += "\n"
 	_, err = f.Write([]byte(hdr))
 	if err != nil {
@@ -445,23 +365,13 @@ func storeMessage(mess Message) error {
 	return nil
 }
 
-func random() uint32 {
-	var buf [4]byte
-	_, err := rand.Read(buf[:])
-	if err != nil {
-		log.Fatalf("crypto random fail: %s", err)
-	}
-	return binary.BigEndian.Uint32(buf[:])
-}
-
 func newKey() (k Key) {
-	k.KeyID = random()
-	k.KeyAlg = AES256GCMkeyalg
-	k.Secret = make([]byte, 32) // 32 is the key length for AES-256
-	_, err := rand.Read(k.Secret)
-	if err != nil {
-		log.Fatalf("random fail: %s", err)
-	}
+	var buf [4]byte
+	rand.Read(buf[:])
+	k.KeyID = binary.BigEndian.Uint32(buf[:])
+	k.KeyAlg = 2 // xchacha20poly1305
+	k.Secret = make([]byte, 32)
+	rand.Read(k.Secret)
 	return k
 }
 
@@ -484,17 +394,6 @@ func filenameMessage(m int) string {
 		log.Fatalf("MessageCounter overflow")
 	}
 	return string(b)
-}
-
-func saveKeyCount() {
-	x, err := json.Marshal(keyCount)
-	if err != nil {
-		log.Fatalf("keyCount marshal failed: %s", err)
-	}
-	err = ioutil.WriteFile("keyCount", x, 0)
-	if err != nil {
-		log.Fatalf("keyCount write failed: %s", err)
-	}
 }
 
 func hdrInt64(b []byte, prefix string) ([]byte, int64, error) {
@@ -551,7 +450,7 @@ func keyval(b []byte, k string) ([]byte, string, error) {
 }
 
 func initialLoad() {
-	x, err := ioutil.ReadFile("PrincipalsDB")
+	x, err := os.ReadFile("PrincipalsDB")
 	if err != nil {
 		log.Fatalf("PrincipalsDB read failed: %s", err)
 	}
@@ -562,22 +461,13 @@ func initialLoad() {
 	np := len(db.Peers)
 	nick = make(map[ID]string, np+1)
 	nickP = make(map[string]*Principal, np)
+	keyP = make(map[uint32]*Principal, np)
 	nick[db.Me] = "me"
 	for _, p := range db.Peers {
 		nick[p.Id] = p.Nick
 		nickP[p.Nick] = p
+		keyP[p.Their.KeyID] = p
 	}
-
-	keyCount = make(map[uint32]uint32, 2*np)
-	x, err = ioutil.ReadFile("keyCount")
-	if err != nil {
-		log.Fatalf("keyCount read failed: %s", err)
-	}
-	err = json.Unmarshal(x, &keyCount)
-	if err != nil {
-		log.Fatalf("keyCount unmarshal failed: %s", err)
-	}
-
 	readMessages()
 
 }
@@ -590,43 +480,33 @@ func initialLoad() {
 func main() {
 	var err error
 	if err = main2(); err != nil {
-		os.Stderr.WriteString(err.Error()+"\n")
+		os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(2)
 	}
 }
 
-func main2() (err error){
+func main2() (err error) {
 	var data []byte
 	if len(os.Args) < 2 {
 		return errors.New("missing subcommand")
 	}
-	defer brokerClose()
 
 	switch os.Args[1] {
-	case "broker-key": // new puck - broker key, an expert-level tool for prototype puck setup
-		id := (random() & 0x00fffffe) | (puckfsVERSION << 24)
-		sec := &secretFile{false, 0, 0, 1200, id, Keygen(), ":9901"}
-		if data, err = json.MarshalIndent(sec, "", "\t"); err != nil {
-			return fmt.Errorf("%v", err)
-		}
-		data = append(data, '\n')
-		if _, err = fmt.Printf("%s\n", data); err != nil {
-			return fmt.Errorf("%v", err)
-		}
 	case "f", "fetch": // Retrieve any pending traffic from broker.
 		var fi []fs.FileInfo
 		var mess Message
 		initialLoad()
 		brokerOpen()
-		if fi, err = puckfs.ReadDir("in"); err != nil {
+		defer pfs.Close()
+		if fi, err = pfs.ReadDir("in"); err != nil {
 			return fmt.Errorf("broker: in: %v", err)
 		}
 		for _, file := range fi {
 			fn := file.Name()
-			if file.IsDir() {
-				return fmt.Errorf("unexpected directory in/%s", fn)
+			if file.Mode()&fs.ModeType != 0 {
+				continue
 			}
-			if data, err = puckfs.ReadFile("in/"+fn); err != nil {
+			if data, err = pfs.ReadFile("in/" + fn); err != nil {
 				return fmt.Errorf("read err on message: %v", err)
 			}
 			if mess, err = validateMessage(data); err != nil {
@@ -634,13 +514,11 @@ func main2() (err error){
 				// Eventually, report and skip, maybe also delete from broker.
 				//    But for now, we want to study each case and deal with it manually.
 			}
-			// TODO skip duplicates
-			// TODO split out image or other indirect
 			Messages = append(Messages, mess)
 			if err = storeMessage(mess); err != nil {
 				return fmt.Errorf("storeMessage failed: %s", err)
 			}
-			if err = puckfs.Remove("in/"+fn); err != nil {
+			if err = pfs.Remove("in/" + fn); err != nil {
 				return fmt.Errorf("unable to remove in/%s: %s", fn, err)
 			}
 		}
@@ -669,6 +547,7 @@ func main2() (err error){
 		db.Peers = append(db.Peers, &p)
 		nick[p.Id] = p.Nick
 		nickP[p.Nick] = &p
+		keyP[p.Their.KeyID] = &p
 		err = saveDB()
 		// next step will be face-to-face "rekey" to overwrite the random values
 	case "l", "list": // Show all saved messages, sent or received.
@@ -694,76 +573,19 @@ func main2() (err error){
 			}
 			fmt.Printf("%s %s %s%s%s %q\n", msg.fn, t, dir, correspondent, ellipsis, msg.Body[:j])
 		}
-	case "puckfs-share":
-		// This is for prototype testing only. The real puckfs server is part of broker, not puck.
-		if len(os.Args) < 3 {
-			return errors.New("usage: hotline puckfs-share dir")
-		}
-		if puckfs, err = Listen("broker-secret"); err != nil {
-			log.Fatalf("Listen with broker-secret: %v", err)
-		}
-		if err = os.Chdir(os.Args[2]); err != nil {
-			return fmt.Errorf("chdir %s: %v", os.Args[2], err)
-		}
-		// TODO  unveil(".","rwc")
-		chanSignal := make(chan os.Signal, 1)
-		signal.Notify(chanSignal, os.Interrupt)
-		go func() {
-			sighandler( <-chanSignal )
-		}()
-		puckfs.HandleRPC()
-		// puckfs = nil // TODO not needed?
-		log.Fatal("broker shutting down")
-	case "rekey":
-		// This is an experiment in how to set or reset the keys for a pair of
-		// principals. It has the advantage that the Puck never needs to listen
-		// on a port, unlike face-to-face ethernet. But it is not a general solution
-		// because random strings are awkward to type and not really random
-		// and the system is specific to AES keylength.
-		// TODO Rekey should also reset snd.w, rcv.w in *-secret.
-		initialLoad()
-		if len(os.Args) != 4 {
-			return errors.New("usage: hotline rekey eric 'random string'")
-		}
-		p, ok := nickP[os.Args[2]]
-		if !ok {
-			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
-		}
-		r := os.Args[3]
-		if len(r) < 16 {
-			return fmt.Errorf("implausibly short: %s", r)
-		}
-		p.Note = "rekey " + time.Now().Format(time.RFC3339)
-		b := make([]byte, 4+len(r))
-		// My.Key
-		binary.BigEndian.PutUint32(b[0:], uint32(db.Me))
-		copy(b[4:], []byte(r))
-		sum := sha512.Sum384(b)
-		p.My.KeyID = binary.BigEndian.Uint32(sum[0:4])
-		p.My.KeyAlg = AES256GCMkeyalg
-		p.My.Secret = make([]byte, 32)
-		copy(p.My.Secret, sum[4:36])
-		// Their.Key
-		binary.BigEndian.PutUint32(b[0:], uint32(p.Id))
-		copy(b[4:], []byte(r))
-		sum = sha512.Sum384(b)
-		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
-		p.Their.KeyAlg = AES256GCMkeyalg
-		p.Their.Secret = make([]byte, 32)
-		copy(p.Their.Secret, sum[4:36])
-		err = saveDB()
 	case "s", "send":
 		initialLoad()
-		b, err := ioutil.ReadAll(os.Stdin)
+		b, err := io.ReadAll(os.Stdin)
 		if err != nil {
 			return fmt.Errorf("failed read stdin: %s", err)
 		}
-		b, msgtyp, indirect, recipients, err := parseDraft(b)
+		b, msgtyp, recipients, err := parseDraft(b)
 		if err != nil {
 			return fmt.Errorf("failed parsing draft message: %s", err)
 		}
 		brokerOpen()
-		mess, err := sendTo(recipients, string(b), msgtyp, indirect)
+		defer pfs.Close()
+		mess, err := sendTo(recipients, string(b), msgtyp)
 		if err != nil {
 			return fmt.Errorf("sendTo: %s", err)
 		}
@@ -780,7 +602,7 @@ func main2() (err error){
 	return
 }
 
-func saveDB() (err error){
+func saveDB() (err error) {
 	var x []byte
 	x, err = json.MarshalIndent(db, "", " ")
 	if err != nil {
@@ -792,37 +614,24 @@ func saveDB() (err error){
 	if err != nil {
 		return fmt.Errorf("archiving PrincipalsDB failed: %s", err)
 	}
-	err = ioutil.WriteFile("PrincipalsDB", x, 0400)
+	err = os.WriteFile("PrincipalsDB", x, 0400)
 	if err != nil {
 		return fmt.Errorf("Yikes! writing PrincipalsDB failed: %s", err)
 	}
 	return
 }
 
-func sighandler(sig os.Signal) {
-	if sig == syscall.SIGINT {
-		// This has a data race, but usually gets manually invoked during a quiet time.
-		writeSecretFile(puckfs)
-		log.Fatalf("caught %s; tried to save packet counters", sig)
-	} else {
-		log.Printf("ignoring signal %s", sig)
-	}
-}
-
 func brokerOpen() {
-	var err error
-	if puckfs != nil {
+	if pfs != nil {
 		return
 	}
-	if puckfs, err = Dial("puck-secret"); err != nil {
+	secretfile, err := os.UserHomeDir()
+	if err != nil {
+		log.Print("unable to get UserHomeDir, using .")
+		secretfile = "."
+	}
+	secretfile = filepath.Join(secretfile, ".ssh", ".puckfs")
+	if pfs, err = puckfs.Dial(secretfile); err != nil {
 		log.Fatalf("unable to Dial broker: %s", err)
 	}
 }
-
-func brokerClose() {
-	if puckfs != nil {
-		puckfs.Close()
-		puckfs = nil
-	}
-}
-
