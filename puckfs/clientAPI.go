@@ -75,11 +75,15 @@ func (p *PuckFS) ReadDir(path string) (fi []fs.FileInfo, err error) {
 	if err = expect(cReaddir, cmd, data); err != nil {
 		return []fs.FileInfo{}, err
 	}
-	datalines := bytes.Split(data, []byte("\n'"))
+	datalines := bytes.Split(data, []byte("\n"))
 	fi = make([]fs.FileInfo, len(datalines))
 	for i, s := range datalines {
-		if len(s) == 0 {   // in case there is an empty after final newline?
-			continue
+		if len(s) == 0 {
+			if i != len(fi)-1 {
+				log.Fatalf("unanticipated empty file from ReadDir %d", i)
+			}
+			fi = fi[:i] // chop empty after final newline
+			break
 		}
 		field := bytes.Split(s, []byte("\000"))
 		if len(field) != 3 {
