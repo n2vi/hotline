@@ -18,11 +18,11 @@ import (
 )
 
 type secretFile struct {
-	DEBUG          bool
-	MTU            int    // largest payload size we will send
-	KeyID          uint32 // unique to (client,server)-pair
-	Secret         string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
-	ServerAddr     string // host:port on network "udp"
+	DEBUG      bool
+	MTU        int    // largest payload size we will send
+	KeyID      uint32 // unique to (client,server)-pair
+	Secret     string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
+	ServerAddr string // host:port on network "udp"
 }
 
 func main() {
@@ -34,7 +34,7 @@ func main() {
 	keyid := binary.BigEndian.Uint32(sec[:4])
 	s.KeyID = keyid & 0xfffffffe // puck has low bit 0
 	sec = sec[4:]
-	s.Secret = "chacha20poly1305:"+base64.StdEncoding.EncodeToString(sec)
+	s.Secret = "chacha20poly1305:" + base64.StdEncoding.EncodeToString(sec)
 	s.ServerAddr = "h.n2vi.net:9901"
 
 	data, err := json.MarshalIndent(s, "", "\t")
@@ -53,4 +53,3 @@ func main() {
 	fmt.Println("puckfs-server")
 	fmt.Println(string(data))
 }
-

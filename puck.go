@@ -69,24 +69,24 @@ type Key struct {
 }
 
 type Message struct {
-	Date     int64
-	From     ID
-	To       []ID
-	MsgType  MessageType
-	Body     []byte
-	fn       string // local filename for storing the message
+	Date    int64
+	From    ID
+	To      []ID
+	MsgType MessageType
+	Body    []byte
+	fn      string // local filename for storing the message
 }
 type MessageType string // "UTF8", "ACK1", "QACK"
 
 var db PrincipalsDB
 var nick map[ID]string
 var nickP map[string]*Principal
-var keyP map[/*KeyID*/uint32]*Principal
+var keyP map[ /*KeyID*/ uint32]*Principal
 var Messages []Message
 var MessageCounter int
 var pfs *puckfs.PuckFS
 var VERSION [4]byte = [4]byte{0x48, 0x4f, 0x54, 0x33} // "HOT3"
-var unmatchedError = errors.New("unmatched")
+var errUnmatched = errors.New("unmatched")
 
 // Send to (nicks) the (text) of form (msgtype).
 // Return the Message struct or error.
@@ -99,7 +99,7 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 		return m, fmt.Errorf("implausibly large number of recipients %d", nr)
 	}
 	m.To = make([]ID, nr)
-	for i := 0; i < nr; i++ {
+	for i := range nr {
 		r, ok := nickP[nicks[i]]
 		if !ok {
 			return m, fmt.Errorf("unrecognized recipient %s", nicks[i])
@@ -127,20 +127,20 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 	binary.BigEndian.PutUint64(plaintext[8:16], uint64(m.Date))
 	binary.BigEndian.PutUint32(plaintext[16:20], uint32(m.From))
 	binary.BigEndian.PutUint16(plaintext[20:22], uint16(nr))
-	for i := 0; i < nr; i++ {
+	for i := range nr {
 		binary.BigEndian.PutUint32(plaintext[22+i*4:], uint32(m.To[i]))
 	}
 	copy(plaintext[22+4*nr:], body)
 	dst := make([]byte, 4+24+len(plaintext)+16)
 
-	for i := 0; i < nr; i++ {
+	for i := range nr {
 		r := nickP[nicks[i]]
 		aead, err := chacha20poly1305.NewX(r.My.Secret)
 		if err != nil {
 			return m, fmt.Errorf("chacha20poly1305.NewX: %s", err)
 		}
 		binary.BigEndian.PutUint32(dst[0:4], r.My.KeyID) // associatedData
-		rand.Read(dst[4:28]) // nonce
+		rand.Read(dst[4:28])                             // nonce
 		dst = aead.Seal(dst, dst[4:28], plaintext, dst[0:4])
 		file := fmt.Sprintf("%s/%x", nicks[i], time.Now().UnixNano())
 		if pfs != nil {
@@ -179,7 +179,7 @@ func validateMessage(data []byte) (m Message, err error) {
 		return m, fmt.Errorf("implausibly large number of recipients %d", nr)
 	}
 	m.To = make([]ID, nr)
-	for i := 0; i < nr; i++ {
+	for i := range nr {
 		m.To[i] = ID(binary.BigEndian.Uint32(plaintext[22+i*4 : 26+i*4]))
 	}
 	m.Body = plaintext[22+nr*4:]
@@ -212,7 +212,7 @@ func unmarshalMessage(fn string, b []byte) (Message, error) {
 	to := make([]ID, 0, 5)
 	for {
 		b, u32, err = hdrUint32Hex(b, "to ")
-		if err == unmatchedError && len(to) > 0 {
+		if err == errUnmatched && len(to) > 0 {
 			break // finished all the to lines
 		}
 		if err != nil {
@@ -248,7 +248,7 @@ func parseDraft(b []byte) ([]byte, MessageType, []string, error) {
 	nicks := make([]string, 0)
 	for {
 		b, v, err = keyval(b, "to")
-		if err == unmatchedError {
+		if err == errUnmatched {
 			break
 		}
 		if err != nil {
@@ -326,7 +326,7 @@ func storeMessage(mess Message) error {
 	f, err := os.Open(bb)
 	if err == nil {
 		_ = f.Close()
-		return fmt.Errorf("Yikes! refuse to store over existing %s", bb)
+		return fmt.Errorf("yikes! refuse to store over existing %s", bb)
 	}
 	f, err = os.OpenFile(bb, os.O_WRONLY|os.O_CREATE|syscall.O_NOFOLLOW, 0600)
 	if err != nil {
@@ -410,7 +410,7 @@ func hdrInt64(b []byte, prefix string) ([]byte, int64, error) {
 		}
 		return b[n+i+j+1:], val, nil
 	}
-	return b, 0, unmatchedError
+	return b, 0, errUnmatched
 }
 
 func hdrUint32Hex(b []byte, prefix string) ([]byte, uint32, error) {
@@ -427,12 +427,12 @@ func hdrUint32Hex(b []byte, prefix string) ([]byte, uint32, error) {
 		}
 		return b[n+i+j+1:], uint32(val), nil
 	}
-	return b, 0, unmatchedError
+	return b, 0, errUnmatched
 }
 
 func keyval(b []byte, k string) ([]byte, string, error) {
-	if bytes.HasPrefix(b, []byte(k)) != true {
-		return b, "", unmatchedError
+	if !bytes.HasPrefix(b, []byte(k)) {
+		return b, "", errUnmatched
 	}
 	b = b[len(k):]
 	if b[0] != ' ' && b[0] != '\t' && b[0] != '\n' { // unsure whether to allow other unicode space
@@ -539,7 +539,7 @@ func main2() (err error) {
 		p.Their = newKey()
 		initialLoad()
 		if ex, ok := nick[p.Id]; ok {
-			return fmt.Errorf("Id %d already in use by %s", p.Id, ex)
+			return fmt.Errorf("p.Id %d already in use by %s", p.Id, ex)
 		}
 		if pex, ok := nickP[p.Nick]; ok {
 			return fmt.Errorf("nickname %s already in use with Id %d", p.Nick, pex.Id)
@@ -597,7 +597,7 @@ func main2() (err error) {
 	case "v", "version":
 		fmt.Printf("puck magic 0x%x\n", VERSION)
 	default:
-		return fmt.Errorf("unrecognized subcommand %s\n", os.Args[1])
+		return fmt.Errorf("unrecognized subcommand %s", os.Args[1])
 	}
 	return
 }
@@ -616,7 +616,7 @@ func saveDB() (err error) {
 	}
 	err = os.WriteFile("PrincipalsDB", x, 0400)
 	if err != nil {
-		return fmt.Errorf("Yikes! writing PrincipalsDB failed: %s", err)
+		return fmt.Errorf("yikes! writing PrincipalsDB failed: %s", err)
 	}
 	return
 }

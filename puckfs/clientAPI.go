@@ -1,8 +1,8 @@
 // Copyright © 2020,2025 Eric Grosse n2vi.com/0BSD
 
 /*
-	Package puckfs provides a primitive network file server and client,
-	atop Go-Back-N retransmission and transport encryption, atop udp.
+Package puckfs provides a primitive network file server and client,
+atop Go-Back-N retransmission and transport encryption, atop udp.
 */
 package puckfs
 
@@ -134,7 +134,7 @@ func (p *PuckFS) Close() (err error) {
 		p.udp = nil
 	} else { // We're a server. Record the call as dropped but keep listening.
 		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
-		p.snd.pop() // We won't be getting an ack for the reply Bye, but pretend we did.
+		p.snd.pop()               // We won't be getting an ack for the reply Bye, but pretend we did.
 		p.caller = &unsetCaller
 	}
 	if !p.snd.empty() || !p.rcv.empty() {
@@ -165,7 +165,7 @@ func Keygen() string {
 	// TODO	Provide rekeying using ML-KEM xor'd with old secret and an optional hashed passphrase.
 	r := make([]byte, chacha20poly1305.KeySize) // 32
 	rand.Read(r)
-	return "chacha20poly1305:"+base64.StdEncoding.EncodeToString(r)
+	return "chacha20poly1305:" + base64.StdEncoding.EncodeToString(r)
 }
 
 func expect(wanted, got uint16, data []byte) (err error) {
@@ -180,8 +180,8 @@ func expect(wanted, got uint16, data []byte) (err error) {
 
 // myFileInfo implements fs.FileInfo
 type myFileInfo struct {
-	name string
-	size int64
+	name  string
+	size  int64
 	mtime int64
 	isdir bool
 }
@@ -210,7 +210,6 @@ func (fi myFileInfo) IsDir() bool {
 	return fi.isdir
 }
 
-func (fi myFileInfo) Sys() interface{} {
+func (fi myFileInfo) Sys() any {
 	return nil
 }
-

@@ -63,29 +63,29 @@ import (
 
 // Type secretFile holds the parsed secret file.
 type secretFile struct {
-	DEBUG          bool
-	MTU            int    // largest payload size we will send
-	PktCnt         string // name of file for snd.w, rcv.w
-	KeyID          uint32 // unique to (client,server)-pair
-	Secret         string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
-	ServerAddr     string // host:port on network "udp"
+	DEBUG      bool
+	MTU        int    // largest payload size we will send
+	PktCnt     string // name of file for snd.w, rcv.w
+	KeyID      uint32 // unique to (client,server)-pair
+	Secret     string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
+	ServerAddr string // host:port on network "udp"
 }
 
 // PuckFS holds the parsed secretFile and ring buffers for the network connection.
 type PuckFS struct {
-	snd            ringBuf // unack'd packets   snd.val=ciphertext including nonce
-	rcv            ringBuf // undeliv'd packets   rcv.val=plaintext cmd+data
-	aead	cipher.AEAD // xchacha20poly1305
-	sec	*secretFile
-	caller	*net.UDPAddr // for client, caller==nil; for server, init &unsetCaller
-	udp	*net.UDPConn // handle for reading and writing packets
+	snd    ringBuf     // unack'd packets   snd.val=ciphertext including nonce
+	rcv    ringBuf     // undeliv'd packets   rcv.val=plaintext cmd+data
+	aead   cipher.AEAD // xchacha20poly1305
+	sec    *secretFile
+	caller *net.UDPAddr // for client, caller==nil; for server, init &unsetCaller
+	udp    *net.UDPConn // handle for reading and writing packets
 }
 
 const (
 	puckfsVERSION = 3
-	maxPayload = 1500 // Largest MTU that the other side might have chosen.
-	ringN = 1<<12 // max cmd payload < MTU*ringN
-	minPacketlen = 8+24+4+2+16
+	maxPayload    = 1500    // Largest MTU that the other side might have chosen.
+	ringN         = 1 << 12 // max cmd payload < MTU*ringN
+	minPacketlen  = 8 + 24 + 4 + 2 + 16
 )
 
 const (
@@ -99,10 +99,11 @@ const (
 	cReaddir
 	cChtime
 )
+
 var cmdNames = []string{"Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir", "Chtime"}
 var unsetCaller net.UDPAddr
-var errBye = errors.New("errBye")       // treat like network disconnect
+var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
 var sendTimeout = time.Duration(5e9) // 5 sec
 var noDeadline time.Time
@@ -129,7 +130,7 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 	if p.sec.DEBUG {
 		log.Printf("sendCmd %s[%d] seqno=%d await %d", cmdNames[cmd], len(data), p.snd.w, p.rcv.w)
 	}
-	if len(data) > p.sec.MTU * ringN / 2 {
+	if len(data) > p.sec.MTU*ringN/2 {
 		log.Printf("implausibly large transfer size %d, likely to fail or hang", len(data))
 	}
 	for {
@@ -146,7 +147,7 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 		ciphertext := make([]byte, 0, len(ad)+24+len(plaintext)+16)
 		ciphertext = append(ciphertext, ad...)
 		n := len(ad)
-		nonce := ciphertext[n:n+24]
+		nonce := ciphertext[n : n+24]
 		rand.Read(nonce)
 		ciphertext = p.aead.Seal(ciphertext[:n+24], nonce, plaintext, ad)
 		err = p.write(ciphertext)
@@ -207,7 +208,7 @@ func (p *PuckFS) awaitEmpty() {
 }
 
 // Read a packet from network, validate, and push onto rcv buffer.
-func (p *PuckFS) readPacket() (error) {
+func (p *PuckFS) readPacket() error {
 	var caller *net.UDPAddr
 	var seqno uint32
 	buf := make([]byte, maxPayload)
@@ -270,7 +271,7 @@ func (p *PuckFS) readPacket() (error) {
 			return errBye
 		}
 	}
-	p.retransmit() // Check retransmission timers.
+	p.retransmit()        // Check retransmission timers.
 	if seqno != p.rcv.w { // Ignore out-of-sequence packets.
 		log.Printf("dropping out-of-sequence packet %s %d %s",
 			cmdNames[cmd], seqno, p.packetCounters())
@@ -319,7 +320,7 @@ func (p *PuckFS) read(buf []byte) ([]byte, *net.UDPAddr, error) {
 		log.Printf("short packet with no err (%d) %v", n, ciphertext)
 		err = errors.New("short packet")
 	}
-	return ciphertext, caller, nil
+	return ciphertext, caller, err
 }
 
 // Low-level write to the network.
@@ -342,7 +343,7 @@ func (p *PuckFS) write(ciphertext []byte) (err error) {
 // If server receives a validated cHello, remember caller's address.
 func (p *PuckFS) callerSet(cmd uint16, caller *net.UDPAddr) {
 	if p.caller == nil {
-		 // If nil, we're a client. And we already know the server's address.
+		// If nil, we're a client. And we already know the server's address.
 		return
 	}
 	if cmd != cHello {
@@ -361,31 +362,33 @@ func (p *PuckFS) callerSet(cmd uint16, caller *net.UDPAddr) {
 
 // Copy (part of) msg into plaintext, prefixed by 6 bytes of ack+cmd.
 func (p *PuckFS) marshal(cmd uint16, msg []byte) (ad, plaintext, unread []byte) {
-	ad = appendUint32(make([]byte,0,8), p.sec.KeyID)
-	ad = appendUint32(ad, p.snd.w) // seqno
+	ad = make([]byte, 8)
+	binary.BigEndian.PutUint32(ad[0:4], p.sec.KeyID)
+	binary.BigEndian.PutUint32(ad[4:8], p.snd.w) // seqno
 	plaintext = make([]byte, 0, p.sec.MTU)
-	plaintext = appendUint32(plaintext, p.rcv.w) // ack
+	binary.BigEndian.PutUint32(plaintext[0:4], p.rcv.w) // ack
 	n := len(msg)
-	if n + 54 > p.sec.MTU { // Is there room for ad, nonce, ack, cmd, msg and auth tag?
+	if n+54 > p.sec.MTU { // Is there room for ad, nonce, ack, cmd, msg and auth tag?
 		if p.sec.DEBUG {
 			log.Printf("  needPartial n=%d MTU=%d\n", n, p.sec.MTU)
 		}
 		cmd = cPartial
 		n = p.sec.MTU - 54
 	}
-	plaintext = appendUint16(plaintext, cmd)
-	plaintext = append(plaintext, msg[:n]...)
+	binary.BigEndian.PutUint16(plaintext[4:6], cmd)
+	plaintext = plaintext[:6+n]
+	copy(plaintext[6:], msg[:n])
 	return ad, plaintext, msg[n:]
 }
 
 // Try to recover from stale counters.
-func (p *PuckFS) bail(seqno, ack uint32) (error){
+func (p *PuckFS) bail(seqno, ack uint32) error {
 	log.Printf("Probably we failed earlier while saving our counters; bailing.")
 	p.snd.w = ack
 	for ok := true; ok; _, ok = p.snd.pop() {
 		// Discard until buffer is empty.
 	}
-	p.rcv.w = seqno+1
+	p.rcv.w = seqno + 1
 	for ok := true; ok; _, ok = p.rcv.pop() {
 		// Discard until buffer is empty.
 	}
@@ -395,10 +398,10 @@ func (p *PuckFS) bail(seqno, ack uint32) (error){
 }
 
 func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error) {
-	log.SetFlags(log.Ldate|log.Ltime|log.Lmicroseconds)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	sec := secretFile{}
 	data, err := os.ReadFile(secretfile)
-	if  err != nil {
+	if err != nil {
 		return addr, p, err
 	}
 	if err = json.Unmarshal(data, &sec); err != nil {
@@ -433,7 +436,7 @@ func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error)
 	var sw, rw uint32
 	n, err := fmt.Sscanf(string(data), "%d %d", &sw, &rw)
 	if n != 2 || err != nil {
-		log.Fatalf("unable to parse %s: %d %v", p.sec.PktCnt, n, err)
+		log.Fatalf("unable to parse %s: %d %v", sec.PktCnt, n, err)
 	}
 	if sw > uint32(1<<29) || rw > uint32(1<<29) {
 		log.Print("time to rekey; PktCnt getting large") // I doubt I'll ever get this.
@@ -458,53 +461,14 @@ func pathPrefix(path string) (mess []byte, err error) {
 	return mess, nil
 }
 
-// The append/consume functions are from go/src/crypto/sha1/sha1.go.
-
-func appendUint64(b []byte, x uint64) []byte {
-	var a [8]byte
-	binary.BigEndian.PutUint64(a[:], x)
-	return append(b, a[:]...)
-}
-
-func appendUint32(b []byte, x uint32) []byte {
-	var a [4]byte
-	binary.BigEndian.PutUint32(a[:], x)
-	return append(b, a[:]...)
-}
-
-func appendUint16(b []byte, x uint16) []byte {
-	var a [2]byte
-	binary.BigEndian.PutUint16(a[:], x)
-	return append(b, a[:]...)
-}
-
-func consumeUint64(b []byte) ([]byte, uint64) {
-	_ = b[7]
-	x := uint64(b[7]) | uint64(b[6])<<8 | uint64(b[5])<<16 | uint64(b[4])<<24 |
-		uint64(b[3])<<32 | uint64(b[2])<<40 | uint64(b[1])<<48 | uint64(b[0])<<56
-	return b[8:], x
-}
-
-func consumeUint32(b []byte) ([]byte, uint32) {
-	_ = b[3]
-	x := uint32(b[3]) | uint32(b[2])<<8 | uint32(b[1])<<16 | uint32(b[0])<<24
-	return b[4:], x
-}
-
-func consumeUint16(b []byte) ([]byte, uint16) {
-	_ = b[1]
-	x := uint16(b[1]) | uint16(b[0])<<8
-	return b[2:], x
-}
-
 // We are using crude Go-Back-N retransmission with no out-of-order packet handling,
 // so we can use ring buffers for keeping track of unacknowleged packets and for
 // keeping track of packets that have been read from the network but not yet processed.
 // This makes for simple scheduling and is good enough for our network assumptions above.
 
 type ringBuf struct {
-	r, w uint32 // seqno
-	p    [ringN][]byte // indexed by seqno mod ringN
+	r, w uint32           // seqno
+	p    [ringN][]byte    // indexed by seqno mod ringN
 	t    [ringN]time.Time // timeout deadline
 }
 
@@ -531,7 +495,7 @@ func (ringBuf *ringBuf) pop() (val []byte, ok bool) {
 	if ringBuf.empty() {
 		return nil, false
 	}
-	j := ringBuf.r&(ringN-1)
+	j := ringBuf.r & (ringN - 1)
 	val = ringBuf.p[j]
 	// ringBuf.p[j] = []byte{} // for benefit of garbage collection   TODO confirm this
 	ringBuf.r++
@@ -547,4 +511,3 @@ func (ringBuf *ringBuf) timeout() (data []byte, t *time.Time, expired bool) {
 	j := ringBuf.r & (ringN - 1)
 	return ringBuf.p[j], &ringBuf.t[j], now.After(ringBuf.t[j])
 }
-

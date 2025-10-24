@@ -18,7 +18,7 @@ import (
 func Listen() (p *PuckFS) {
 	var err error
 	var addr *net.UDPAddr
-	log.SetFlags(log.Ldate|log.Ltime|log.Lmicroseconds)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	secretfile, err := os.UserHomeDir()
 	if err != nil {
 		log.Print("unable to get UserHomeDir, using .")
@@ -59,10 +59,15 @@ func (p *PuckFS) HandleRPC() {
 		case cHello:
 			now := time.Now().UTC()
 			there, err := time.Parse(time.RFC3339, string(req))
+			if err != nil {
+				log.Printf("invalid time format in %s: %s", string(req), err)
+				reject(p, cHello, "invalid time format")
+				continue
+			}
 			delta := now.Sub(there).Seconds()
 			if math.Abs(delta) > 10. {
 				log.Printf("server %s, client %s\n", now.String(), there.String())
-				reject(p, cHello, "computer clocks can surely be better calibrated than 10sec?")
+				reject(p, cHello, "clocks can surely be better calibrated than 10sec?")
 				continue
 			}
 			if math.Abs(delta) > 2. {
@@ -75,7 +80,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			log.Print("Hello")
 		case cReadfile:
-			if file, req, err = extractFilename(req); err != nil {
+			if file, _, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -89,7 +94,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cWritefile:
-			if file, req, err = extractFilename(req); err != nil {
+			if file, _, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -103,7 +108,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cRemove:
-			if file, req, err = extractFilename(req); err != nil {
+			if file, _, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -117,7 +122,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cReaddir:
-			if file, req, err = extractFilename(req); err != nil {
+			if file, _, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -145,7 +150,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 		case cChtime:
 			var t int64
-			if file, req, err = extractFilename(req); err != nil {
+			if file, _, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -183,7 +188,7 @@ func (p *PuckFS) HandleRPC() {
 }
 
 // Extract zero-byte terminated file name (or entire input).
-func extractFilename(req  []byte) (file string, remainder []byte, err error) {
+func extractFilename(req []byte) (file string, remainder []byte, err error) {
 	j := bytes.IndexByte(req, 0)
 	if j < 0 {
 		file = string(req)
@@ -192,8 +197,8 @@ func extractFilename(req  []byte) (file string, remainder []byte, err error) {
 		file = string(req[:j])
 		remainder = req[j+1:]
 	}
-	
-	if fs.ValidPath(file) == false {
+
+	if !fs.ValidPath(file) {
 		return "", req, errBye
 	}
 	return file, remainder, nil
@@ -207,4 +212,3 @@ func reject(p *PuckFS, cmd uint16, mess string) {
 		log.Fatalf("unable to even send rejection %v", err)
 	}
 }
-
