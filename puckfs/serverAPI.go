@@ -84,6 +84,7 @@ func (p *PuckFS) HandleRPC() {
 				reject(p, cError, "bad filename")
 				continue
 			}
+			_ = req
 			if resp, err = os.ReadFile(file); err != nil { // open file under local directory
 				reject(p, cError, err.Error())
 				continue
@@ -112,6 +113,7 @@ func (p *PuckFS) HandleRPC() {
 				reject(p, cError, "bad filename")
 				continue
 			}
+			_ = req
 			if err = os.Remove(file); err != nil {
 				reject(p, cError, err.Error())
 				continue
@@ -126,6 +128,7 @@ func (p *PuckFS) HandleRPC() {
 				reject(p, cError, "bad filename")
 				continue
 			}
+			_ = req
 			entries, err := os.ReadDir(file)
 			if err != nil {
 				reject(p, cError, err.Error())
