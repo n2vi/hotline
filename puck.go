@@ -12,15 +12,15 @@ recipient's broker through the high-resilience ROCCS network,
 though in our current simulator that is merely moving the (end-to-
 end encrypted) message file from one directory to another.
 
-If you're a fellow hotline developer, I will have already emailed you
-a file to install in $HOME/.ssh/.puckfs to talk to the broker/ROCCS-simulator
-that I run. Go install the hotline executable. Then:
+If you're a fellow hotline developer, I will have already sent you a secret
+file to install in $HOME/.ssh/.puckfs to talk to the broker/ROCCS-simulator
+that I run. Also "echo 0 0 > $HOME/.puckfs" for the initial packet counters.
+If you haven't already, download the hotline source and "go install".
+Then create a directory such as $HOME/puck for your end-to-end secrets
+and messages and inside that directory:
 
-	echo '{"Me": randomintyougotbymail, "Peers": []}' > PrincipalsDB
-	echo '0 0' > .puckfs
-	mkdir archiveDB; chmod go-rw PrincipalsDB archiveDB
-	hotline introduction 1446134797 eric
-	hotline rekey eric randomstringIEmailedandSignaledyou
+	tar xf yourpuck.tar
+	hotline rekey eric randomstringwepick
 
 Just working out ideas here; don't consider this final.
 Comments welcome to grosse@gmail.com.
@@ -30,6 +30,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -141,7 +142,7 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 		}
 		binary.BigEndian.PutUint32(dst[0:4], r.My.KeyID) // associatedData
 		rand.Read(dst[4:28])                             // nonce
-		dst = aead.Seal(dst, dst[4:28], plaintext, dst[0:4])
+		dst = aead.Seal(dst[:28], dst[4:28], plaintext, dst[0:4])
 		file := fmt.Sprintf("%s/%x", nicks[i], time.Now().UnixNano())
 		if pfs != nil {
 			fmt.Printf("WriteFile %s\n", file)
@@ -158,12 +159,15 @@ func validateMessage(data []byte) (m Message, err error) {
 	keyID := binary.BigEndian.Uint32(data[0:4])
 	sender, ok := keyP[keyID]
 	if !ok {
-		return m, fmt.Errorf("no peer found for keyID %0x=%d", keyID, keyID)
+		log.Printf("validateMessage %v", data)
+		return m, fmt.Errorf("no peer found for keyID %0x", keyID)
 	}
+	log.Printf("keyID %x=%d", data[0:4], keyID) // TODO
 	aead, err := chacha20poly1305.NewX(sender.Their.Secret)
 	if err != nil {
 		return m, fmt.Errorf("chacha20poly1305.NewX: %s", err)
 	}
+	log.Printf("nonce %x ad %x ciphertext %x", data[4:28], data[0:4], data[28:]) // TODO
 	plaintext, err := aead.Open(nil, data[4:28], data[28:], data[0:4])
 	if err != nil {
 		return m, err
@@ -573,6 +577,40 @@ func main2() (err error) {
 			}
 			fmt.Printf("%s %s %s%s%s %q\n", msg.fn, t, dir, correspondent, ellipsis, msg.Body[:j])
 		}
+	case "rekey":
+		// This is an experiment in how to set or reset the keys for a pair of
+		// principals. It has the advantage that the Puck never needs to listen
+		// on a port, unlike face-to-face ethernet. But it is not a general solution
+		// because random strings are awkward to type and not really random.
+		initialLoad()
+		if len(os.Args) != 4 {
+			return errors.New("usage: hotline rekey eric 'random string'")
+		}
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		r := os.Args[3]
+		if len(r) < 16 {
+			return fmt.Errorf("implausibly short: %s", r)
+		}
+		p.Note = "rekey " + time.Now().Format(time.RFC3339)
+		b := make([]byte, 4+len(r))
+		// My.Key
+		binary.BigEndian.PutUint32(b[0:], uint32(db.Me))
+		copy(b[4:], []byte(r))
+		sum := sha512.Sum384(b)
+		p.My.KeyID = binary.BigEndian.Uint32(sum[0:4])
+		p.My.KeyAlg = 2 // xchacha20poly1305
+		copy(p.My.Secret, sum[4:36])
+		// Their.Key
+		binary.BigEndian.PutUint32(b[0:], uint32(p.Id))
+		copy(b[4:], []byte(r))
+		sum = sha512.Sum384(b)
+		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
+		p.Their.KeyAlg = 2 // xchacha20poly1305
+		copy(p.Their.Secret, sum[4:36])
+		err = saveDB()
 	case "s", "send":
 		initialLoad()
 		b, err := io.ReadAll(os.Stdin)

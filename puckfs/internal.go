@@ -381,21 +381,21 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (ad, plaintext, unread []byte) 
 	return ad, plaintext, msg[n:]
 }
 
-// Try to recover from stale counters.
-func (p *PuckFS) bail(seqno, ack uint32) error {
-	log.Printf("Probably we failed earlier while saving our counters; bailing.")
-	p.snd.w = ack
-	for ok := true; ok; _, ok = p.snd.pop() {
-		// Discard until buffer is empty.
-	}
-	p.rcv.w = seqno + 1
-	for ok := true; ok; _, ok = p.rcv.pop() {
-		// Discard until buffer is empty.
-	}
-	log.Printf("forced %d %d %d %d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
-	p.Close()
-	return errBye
-}
+// // Try to recover from stale counters.
+// func (p *PuckFS) bail(seqno, ack uint32) error {
+// 	log.Printf("Probably we failed earlier while saving our counters; bailing.")
+// 	p.snd.w = ack
+// 	for ok := true; ok; _, ok = p.snd.pop() {
+// 		// Discard until buffer is empty.
+// 	}
+// 	p.rcv.w = seqno + 1
+// 	for ok := true; ok; _, ok = p.rcv.pop() {
+// 		// Discard until buffer is empty.
+// 	}
+// 	log.Printf("forced %d %d %d %d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
+// 	p.Close()
+// 	return errBye
+// }
 
 func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error) {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -453,7 +453,7 @@ func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error)
 // Possibly in the future we will change to a more general purpose binary design like 9P2000
 // but for now we're putting mostly-human-readable bytes into messages.
 func pathPrefix(path string) (mess []byte, err error) {
-	if fs.ValidPath(path) == false {
+	if !fs.ValidPath(path) {
 		return []byte{}, errors.New("%s does not meet standards of io/fs.ValidPath")
 	}
 	mess = []byte(path)

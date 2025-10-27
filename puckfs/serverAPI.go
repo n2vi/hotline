@@ -26,7 +26,7 @@ func Listen() (p *PuckFS) {
 	}
 	secretfile = filepath.Join(secretfile, ".ssh", ".puckfs")
 	if addr, p, err = readSecretFile(secretfile); err != nil {
-		log.Fatalf("readSecretFile returned %v", err)
+		log.Fatalf("euid %d readSecretFile returned %v", os.Geteuid(), err)
 	}
 	if p.sec.KeyID&1 != 1 { // can't happen except by catastrophic blunder
 		log.Fatal("wanted KeyID for server, got client")
@@ -71,7 +71,7 @@ func (p *PuckFS) HandleRPC() {
 				continue
 			}
 			if math.Abs(delta) > 2. {
-				resp = []byte(fmt.Sprintf("%.0f", delta))
+				resp = fmt.Appendf(nil, "%.0f", delta)
 			}
 			if err = p.sendCmd(cHello, resp); err != nil {
 				log.Printf("cHello err %v", err)
@@ -80,7 +80,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			log.Print("Hello")
 		case cReadfile:
-			if file, _, err = extractFilename(req); err != nil {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -94,7 +94,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cWritefile:
-			if file, _, err = extractFilename(req); err != nil {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -108,7 +108,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cRemove:
-			if file, _, err = extractFilename(req); err != nil {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -122,7 +122,7 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cReaddir:
-			if file, _, err = extractFilename(req); err != nil {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
@@ -150,7 +150,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 		case cChtime:
 			var t int64
-			if file, _, err = extractFilename(req); err != nil {
+			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
 				continue
 			}
