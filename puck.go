@@ -114,13 +114,6 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 	m.Body = []byte(text)
 	body := m.Body
 
-	//    4   magic
-	//    4   msgtype
-	//    8   unixtime
-	//    4   sender
-	//    2   nr
-	//  4*nr recipients
-	//  len  body
 	n := 22 + 4*nr + len(body)
 	plaintext := make([]byte, n)
 	copy(plaintext[0:4], VERSION[:])
@@ -159,15 +152,12 @@ func validateMessage(data []byte) (m Message, err error) {
 	keyID := binary.BigEndian.Uint32(data[0:4])
 	sender, ok := keyP[keyID]
 	if !ok {
-		log.Printf("validateMessage %v", data)
 		return m, fmt.Errorf("no peer found for keyID %0x", keyID)
 	}
-	log.Printf("keyID %x=%d", data[0:4], keyID) // TODO
 	aead, err := chacha20poly1305.NewX(sender.Their.Secret)
 	if err != nil {
 		return m, fmt.Errorf("chacha20poly1305.NewX: %s", err)
 	}
-	log.Printf("nonce %x ad %x ciphertext %x", data[4:28], data[0:4], data[28:]) // TODO
 	plaintext, err := aead.Open(nil, data[4:28], data[28:], data[0:4])
 	if err != nil {
 		return m, err
@@ -179,15 +169,11 @@ func validateMessage(data []byte) (m Message, err error) {
 	m.Date = int64(binary.BigEndian.Uint64(plaintext[8:16]))
 	m.From = ID(binary.BigEndian.Uint32(plaintext[16:20]))
 	nr := int(binary.BigEndian.Uint16(plaintext[20:22]))
-	if nr > 100 {
-		return m, fmt.Errorf("implausibly large number of recipients %d", nr)
-	}
 	m.To = make([]ID, nr)
 	for i := range nr {
 		m.To[i] = ID(binary.BigEndian.Uint32(plaintext[22+i*4 : 26+i*4]))
 	}
 	m.Body = plaintext[22+nr*4:]
-	m.fn = "unset"
 	return m, nil
 }
 
@@ -241,11 +227,7 @@ func unmarshalMessage(fn string, b []byte) (Message, error) {
 }
 
 // parseDraft is very similar to unmarshalMessage, but for human-created input.
-// Specifically, it expects (b) of the form
-//
-//	to nicks
-//
-//	some text
+// Specifically, it expects (b) with a line "to nicks", a blank line, then the text.
 func parseDraft(b []byte) ([]byte, MessageType, []string, error) {
 	var v string
 	var err error
