@@ -17,8 +17,7 @@ technical team.
 * hotline cryptography.pdf - puck-to-puck protocol
 * hotline networking.pdf - puck-to-ROCCS protocol
 * puck.go - end device message handling
-* puckfs.go - network app for puck and ROCCS
-* ascon.go - lightweight crypto for puckfs.go 
+* puckfs - network app for puck and ROCCS
 
 -----
 
