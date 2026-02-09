@@ -14,8 +14,8 @@ intended to provide a basis for discussing possible approaches
 to then be more professionally created by an international
 technical team.
 
-* hotline cryptography.pdf - puck-to-puck protocol
-* hotline networking.pdf - puck-to-ROCCS protocol
+* cryptography.pdf - puck-to-puck protocol
+* networking.pdf - puck-to-ROCCS protocol
 * puck.go - end device message handling
 * puckfs - network app for puck and ROCCS
 
