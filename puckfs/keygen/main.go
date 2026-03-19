@@ -69,7 +69,7 @@ func main() {
 	if narg == 1 {
 		s.ServerAddr = ":14400"
 	}
-	s.PktCnt = filepath.Join(home, ".ssh", "puckfs")
+	s.PktCnt = filepath.Join(home, ".puckfs")
 
 	data, err := json.MarshalIndent(s, "", "\t")
 	if err != nil {
