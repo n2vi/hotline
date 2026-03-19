@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
@@ -23,12 +24,17 @@ import (
 type secretFile struct {
 	DEBUG      bool
 	MTU        int    // largest payload size we will send
+	PktCnt     string // name of file for snd.w, rcv.w
 	KeyID      uint32 // unique to (client,server)-pair
 	Secret     string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
 	ServerAddr string // host:port on network "udp"
 }
 
 func main() {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatalf("expected $HOME, got err %s", err)
+	}
 	var s secretFile
 	s.MTU = 1200
 	sec := make([]byte, 4+chacha20poly1305.KeySize) // 36
@@ -60,6 +66,10 @@ func main() {
 	sec = sec[4:]
 	s.Secret = "chacha20poly1305:" + base64.StdEncoding.EncodeToString(sec)
 	s.ServerAddr = "h.n2vi.net:14400"
+	if narg == 1 {
+		s.ServerAddr = ":14400"
+	}
+	s.PktCnt = filepath.Join(home, ".ssh", "puckfs")
 
 	data, err := json.MarshalIndent(s, "", "\t")
 	if err != nil {
