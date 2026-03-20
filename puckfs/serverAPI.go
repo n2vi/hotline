@@ -19,12 +19,15 @@ func Listen() (p *PuckFS) {
 	var err error
 	var addr *net.UDPAddr
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
-	secretfile, err := os.UserHomeDir()
-	if err != nil {
-		log.Print("unable to get UserHomeDir, using .")
-		secretfile = "."
+	secretfile := os.Getenv("SF")
+	if secretfile == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Print("unable to get UserHomeDir, using .")
+			home = "."
+		}
+		secretfile = filepath.Join(home, ".ssh", ".puckfs")
 	}
-	secretfile = filepath.Join(secretfile, ".ssh", ".puckfs")
 	if addr, p, err = readSecretFile(secretfile); err != nil {
 		log.Fatalf("euid %d readSecretFile returned %v", os.Geteuid(), err)
 	}

@@ -29,12 +29,15 @@ func main() {
 	if len(os.Args) != 3 {
 		log.Fatal("usage: puckfs {get|put} path")
 	}
-	secretfile, err := os.UserHomeDir()
-	if err != nil {
-		log.Print("unable to get UserHomeDir, using .")
-		secretfile = "."
+	secretfile := os.Getenv("SF")
+	if secretfile == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			log.Print("unable to get UserHomeDir, using .")
+			home = "."
+		}
+		secretfile = filepath.Join(home, ".ssh", ".puckfs")
 	}
-	secretfile = filepath.Join(secretfile, ".ssh", ".puckfs")
 	p, err := puckfs.Dial(secretfile)
 	chk(err)
 	chanSignal := make(chan os.Signal, 1)
