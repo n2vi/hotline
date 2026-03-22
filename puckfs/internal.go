@@ -127,6 +127,7 @@ func (p *PuckFS) clientRPC(scmd uint16, req []byte) (rcmd uint16, resp []byte) {
 
 // Send a command, if necessary as multiple packets.
 func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
+	var ad, plaintext []byte
 	if p.sec.DEBUG {
 		log.Printf("sendCmd %s[%d] seqno=%d await %d", cmdNames[cmd], len(data), p.snd.w, p.rcv.w)
 	}
@@ -141,9 +142,14 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 			}
 		}
 		if p.sec.DEBUG {
-			log.Printf("  cmd=%s data=%q", cmdNames[cmd], data)
+			if len(data) > 300 {
+				log.Printf("  cmd=%s data=%q...%q", cmdNames[cmd], data[:250],
+					data[len(data)-50:])
+			} else {
+				log.Printf("  cmd=%s data=%q", cmdNames[cmd], data)
+			}
 		}
-		ad, plaintext, data := p.marshal(cmd, data)
+		ad, plaintext, data = p.marshal(cmd, data)
 		ciphertext := make([]byte, 0, len(ad)+24+len(plaintext)+16)
 		ciphertext = append(ciphertext, ad...)
 		n := len(ad)
