@@ -39,7 +39,7 @@ func main() {
 		secretfile = filepath.Join(home, ".ssh", ".puckfs")
 	}
 	p, err := puckfs.Dial(secretfile)
-	chk(err)
+	chk(p, err)
 	chanSignal := make(chan os.Signal, 1)
 	signal.Notify(chanSignal, os.Interrupt, syscall.SIGTERM)
 	go func() {
@@ -49,24 +49,27 @@ func main() {
 	switch os.Args[1] {
 	case "get":
 		data, err := p.ReadFile(os.Args[2])
-		chk(err)
+		chk(p, err)
 		err = os.WriteFile(os.Args[2], data, 0660)
-		chk(err)
+		chk(p, err)
 	case "put":
 		data, err := os.ReadFile(os.Args[2])
-		chk(err)
+		chk(p, err)
 		err = p.WriteFile(os.Args[2], data)
-		chk(err)
+		chk(p, err)
 	default:
 		log.Fatalf("unimplemented command %s", os.Args[1])
 	}
 
 	err = p.Close()
-	chk(err)
+	chk(nil, err)
 }
 
-func chk(err error) {
+func chk(p *puckfs.PuckFS, err error) {
 	if err != nil {
+		if p != nil {
+			p.Close()
+		}
 		log.Fatal(err)
 	}
 }
