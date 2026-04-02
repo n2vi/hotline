@@ -46,21 +46,36 @@ func main() {
 		sighandler(<-chanSignal)
 	}()
 
-	switch os.Args[1] {
-	case "get":
-		data, err := p.ReadFile(os.Args[2])
+	cmd := os.Args[1]
+	pathname := os.Args[2]
+	isdir := pathname[len(pathname)-1] == '/'
+	if cmd == "get" && !isdir {
+		data, err := p.ReadFile(pathname)
 		chk(p, err)
-		err = os.WriteFile(os.Args[2], data, 0660)
+		err = os.WriteFile(pathname, data, 0660)
 		chk(p, err)
-	case "put":
-		data, err := os.ReadFile(os.Args[2])
+	} else if cmd == "get" && isdir {
+		fi, err := p.ReadDir(pathname)
 		chk(p, err)
-		err = p.WriteFile(os.Args[2], data)
+		err = os.MkdirAll(pathname, 0770)
+		for _, f := range fi {
+			fn := pathname + f.Name()
+			data, err := p.ReadFile(fn)
+			chk(p, err)
+			err = os.WriteFile(fn, data, 0660)
+		}
+	} else if cmd == "put" && !isdir {
+		data, err := os.ReadFile(pathname)
 		chk(p, err)
-	default:
-		log.Fatalf("unimplemented command %s", os.Args[1])
+		err = p.WriteFile(pathname, data)
+		chk(p, err)
+	} else if cmd == "put" && isdir {
+		p.Close()
+		log.Fatalf("put {dir} not implemented yet")
+	} else {
+		p.Close()
+		log.Fatalf("unimplemented command %s", cmd)
 	}
-
 	err = p.Close()
 	chk(nil, err)
 }

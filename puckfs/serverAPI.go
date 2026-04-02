@@ -127,11 +127,18 @@ func (p *PuckFS) HandleRPC() {
 				return
 			}
 		case cReaddir:
-			if file, req, err = extractFilename(req); err != nil {
-				reject(p, cError, "bad filename")
+			// fs Path Names must not end with a slash, but we require it. Adjust.
+			file := string(req)
+			_ = req
+			if file[len(file)-1] != '/' {
+				reject(p, cError, "cReaddir requires trailing slash")
 				continue
 			}
-			_ = req
+			file = file[:len(file)-1]
+			if !fs.ValidPath(file) {
+				reject(p, cError, "bad dirname")
+				continue
+			}
 			entries, err := os.ReadDir(file)
 			if err != nil {
 				reject(p, cError, err.Error())
