@@ -1,10 +1,9 @@
-// Copyright © 2020,2025 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020,2025,2026 Eric Grosse n2vi.com/0BSD
 
 package puckfs
 
 // These are the network and crypto internal mechanisms. For context,
-// first read the "Hotline Networking" doc at github.com/n2vi/hotline/.
-// TODO   That doc needs updating, since we've changed to xchacha20poly1305.
+// first read github.com/n2vi/hotline/networking.pdf.
 // A sketch of packets as encoded on the wire:
 // (~40 bytes) ether, IP, UDP header bytes which we ignore.
 // (8) ad "Associated Data": (4) KeyID, (4) seqno of this packet
@@ -79,17 +78,19 @@ type PuckFS struct {
 	sec    *secretFile
 	caller *net.UDPAddr // for client, caller==nil; for server, init &unsetCaller
 	udp    *net.UDPConn // handle for reading and writing packets
+	dropcnt	int // client bails out if too many dropped packets
 }
 
 const (
 	puckfsVERSION = 3
 	maxPayload    = 1500    // Largest MTU that the other side might have chosen.
-	ringN         = 1 << 12 // max cmd payload < MTU*ringN
+	ringN         = 1 << 5   // TODO was 12   // max cmd payload < MTU*ringN
 	minPacketlen  = 8 + 24 + 4 + 2 + 16
 )
 
 const (
-	cPartial uint16 = iota
+	cAck 	uint16 = iota
+	cPartial
 	cError
 	cBye
 	cHello
@@ -100,12 +101,12 @@ const (
 	cChtime
 )
 
-var cmdNames = []string{"Partial", "Error", "Bye", "Hello", "Readfile",
+var cmdNames = []string{"Ack", "Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir", "Chtime"}
 var unsetCaller net.UDPAddr
 var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
-var sendTimeout = time.Duration(5e9) // 5 sec
+var sendTimeout = time.Duration(10e9) // 10 sec
 var noDeadline time.Time
 
 // ClientRPC sends scmd+req and then reads rcmd+resp. Errors are returned in rcmd.
@@ -173,11 +174,30 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 	return
 }
 
+// Send a lightweight Ack packet; no need for retransmit or ack. Don't advance p.snd.
+func (p *PuckFS) sendAck() (err error) {
+	var ad, plaintext []byte
+	if p.sec.DEBUG {
+		log.Printf("sendAck seqno=%d await %d", p.snd.w, p.rcv.w)
+	}
+	data := []byte{}
+	ad, plaintext, data = p.marshal(cAck, data)
+	ciphertext := make([]byte, 0, len(ad)+24+len(plaintext)+16)
+	ciphertext = append(ciphertext, ad...)
+	n := len(ad)
+	nonce := ciphertext[n : n+24]
+	rand.Read(nonce)
+	ciphertext = p.aead.Seal(ciphertext[:n+24], nonce, plaintext, ad)
+	err = p.write(ciphertext)
+	return
+}
+
 // Read an RPC request or response.
 func (p *PuckFS) readCmd() (cmd uint16, data []byte, err error) {
 	data = make([]byte, 0)
 	var sav []byte // cmd+data from one ringBuf entry
 	var ok bool
+	partialcnt := 0
 	for cmd = cPartial; cmd == cPartial; {
 		for p.rcv.empty() {
 			if err = p.readPacket(); err != nil {
@@ -190,6 +210,13 @@ func (p *PuckFS) readCmd() (cmd uint16, data []byte, err error) {
 		}
 		cmd = binary.BigEndian.Uint16(sav[:2])
 		data = append(data, sav[2:]...)
+		partialcnt++
+		if partialcnt >= 10 {
+			if err = p.sendAck(); err != nil {
+				log.Printf("tried to send Ack: %s", err)
+			}
+			partialcnt = 0
+		}
 		if p.sec.DEBUG {
 			log.Printf("  got {%d} %s", len(sav)-2, p.packetCounters())
 		}
@@ -221,7 +248,7 @@ func (p *PuckFS) readPacket() error {
 	plaintext := make([]byte, maxPayload)
 
 	if !p.snd.empty() { // only useful to timeout if we have something to retransmit
-		p.udp.SetReadDeadline(time.Now().Add(5 * time.Second))
+		p.udp.SetReadDeadline(time.Now().Add(sendTimeout))
 	}
 	retry := 0
 	for {
@@ -235,7 +262,7 @@ func (p *PuckFS) readPacket() error {
 					log.Printf("deadline")
 				}
 				p.retransmit()
-				p.udp.SetReadDeadline(time.Now().Add(30 * time.Second))
+				p.udp.SetReadDeadline(time.Now().Add(4 * sendTimeout))
 				continue
 			}
 			p.udp.SetReadDeadline(noDeadline)
@@ -281,6 +308,18 @@ func (p *PuckFS) readPacket() error {
 	if seqno != p.rcv.w { // Ignore out-of-sequence packets.
 		log.Printf("dropping out-of-sequence packet %s %d %s",
 			cmdNames[cmd], seqno, p.packetCounters())
+		p.dropcnt++
+		if p.dropcnt > 20 && p.caller == nil {
+			p.WritePktCnt()
+			log.Fatal("too many drops in a row, bailing out")
+		}
+		if err := p.sendAck(); err != nil {
+			log.Printf("tried to send Ack: %s", err)
+		}
+		return nil
+	}
+	p.dropcnt = 0 // got a valid packet, so hope network recovered
+	if cmd == cAck { // special lightweight packet; don't advance p.rcv.
 		return nil
 	}
 	if ok := p.rcv.push(plaintext[4:], noDeadline); !ok { // Ignore if we don't have room to save.
@@ -451,7 +490,7 @@ func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error)
 	snd.w = sw
 	rcv.r = rw
 	rcv.w = rw
-	puckfs := PuckFS{snd, rcv, aead, &sec, &unsetCaller, nil}
+	puckfs := PuckFS{snd, rcv, aead, &sec, &unsetCaller, nil, 0}
 	return addr, &puckfs, nil
 }
 
