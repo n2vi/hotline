@@ -107,17 +107,6 @@ func (p *PuckFS) ReadDir(path string) (fi []fs.FileInfo, err error) {
 	return fi, err
 }
 
-// Chtime changes the "modified" time on the file.
-func (p *PuckFS) Chtime(path string, mtime int64) (err error) {
-	var mess []byte
-	if mess, err = pathPrefix(path); err != nil {
-		return err
-	}
-	mess = strconv.AppendInt(mess, mtime, 10)
-	cmd, mess := p.clientRPC(cChtime, mess)
-	return expect(cChtime, cmd, mess)
-}
-
 func (p *PuckFS) Close() (err error) {
 	if p.sec.DEBUG {
 		log.Printf("Close")

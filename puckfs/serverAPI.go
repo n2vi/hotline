@@ -161,27 +161,6 @@ func (p *PuckFS) HandleRPC() {
 				p.Close()
 				return
 			}
-		case cChtime:
-			var t int64
-			if file, req, err = extractFilename(req); err != nil {
-				reject(p, cError, "bad filename")
-				continue
-			}
-			if t, err = strconv.ParseInt(string(req), 10, 64); err != nil {
-				reject(p, cError, err.Error())
-				continue
-			}
-			mtime := time.Unix(t, 0)
-			if err = os.Chtimes(file, mtime, mtime); err != nil {
-				reject(p, cError, err.Error())
-				continue
-			}
-			resp = []byte{}
-			if err = p.sendCmd(cWritefile, resp); err != nil {
-				log.Printf("cWritefile sendCmd err %v", err)
-				p.Close()
-				return
-			}
 		case cBye:
 			p.Close()
 			log.Print("Bye")

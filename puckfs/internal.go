@@ -98,11 +98,10 @@ const (
 	cWritefile
 	cRemove
 	cReaddir
-	cChtime
 )
 
 var cmdNames = []string{"Ack", "Partial", "Error", "Bye", "Hello", "Readfile",
-	"Writefile", "Remove", "Readdir", "Chtime"}
+	"Writefile", "Remove", "Readdir"}
 var unsetCaller net.UDPAddr
 var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
