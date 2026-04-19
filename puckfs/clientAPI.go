@@ -1,4 +1,4 @@
-// Copyright © 2020,2025 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020,2025, 2026 Eric Grosse n2vi.com/0BSD
 
 /*
 Package puckfs provides a primitive network file server and client,
@@ -15,34 +15,30 @@ import (
 	"io/fs"
 	"log"
 	"net"
-	"os"
 	"strconv"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// Dial calls the puckfs server and checks clocks for consistency.
+// Dial calls the puckfs server. Doen't deal with lost initial handshake.
 func Dial(secretfile string) (p *PuckFS, err error) {
 	var addr *net.UDPAddr
 	if addr, p, err = readSecretFile(secretfile); err != nil {
 		return p, err
 	}
-	p.caller = nil
 	if p.sec.KeyID&1 != 0 { // can't happen except by catastrophic blunder
 		return p, errors.New("wanted KeyID for client, got server")
 	}
 	if p.udp, err = net.DialUDP("udp", nil, addr); err != nil {
 		return p, err
 	}
-	cmd, data := p.clientRPC(cHello, []byte(time.Now().UTC().Format(time.RFC3339)))
-	if err = expect(cHello, cmd, data); err != nil {
-		return p, err
+	_, _, err = p.bareCmd(cHello, []byte(strconv.FormatInt(time.Now().UnixMilli(),10)))
+	if err = p.readPacket(); err != nil {
+		log.Fatalf("Hello reply failed %s", err)
 	}
-	if len(data) > 0 {
-		log.Printf("our clock is %s behind", data)
-	}
-	return p, err
+	// Now ring buffers are initialized and we can use clientRPC.
+	return p, nil
 }
 
 // ReadFile fetches file contents.
@@ -114,7 +110,7 @@ func (p *PuckFS) Close() (err error) {
 	if p.udp == nil {
 		return errBye
 	}
-	if p.caller == nil { // We're a client. Drop the network call.
+	if !p.serverside { // We're a client. Drop the network call.
 		cmd, mess := p.clientRPC(cBye, []byte{})
 		if expect(cBye, cmd, mess) != nil {
 			log.Print("may have had trouble saying Bye")
@@ -124,7 +120,8 @@ func (p *PuckFS) Close() (err error) {
 	} else { // We're a server. Record the call as dropped but keep listening.
 		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
 		p.snd.pop()               // We won't be getting an ack for the reply Bye, but pretend we did.
-		p.caller = &unsetCaller
+		p.caller = nil
+		p.WritePktCnt()
 	}
 	if !p.snd.empty() || !p.rcv.empty() {
 		log.Print("Buffers not empty. Check file *-secret on puck and broker!!!")
@@ -132,22 +129,7 @@ func (p *PuckFS) Close() (err error) {
 		p.snd.r = p.snd.w
 		p.rcv.r = p.rcv.w
 	}
-	p.WritePktCnt()
 	return
-}
-
-func (p *PuckFS) WritePktCnt() {
-	f, err := os.OpenFile(p.sec.PktCnt, os.O_RDWR, 0600)
-	if err != nil {
-		log.Printf("%d %d\n", p.snd.w, p.rcv.w)
-		log.Fatal(err)
-	}
-	fmt.Fprintf(f, "%d %d\n", p.snd.w, p.rcv.w)
-	err = f.Close()
-	if err != nil {
-		log.Printf("%d %d\n", p.snd.w, p.rcv.w)
-		log.Fatal(err)
-	}
 }
 
 func Keygen() string {

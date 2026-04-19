@@ -12,16 +12,19 @@ package puckfs
 // (2) cmd, enciphered
 // (n) data, enciphered
 // (16) authentication tag; if decrypt fails, packet is discarded.
-// Packet sequence numbers, "seqno", are independent for sender and receiver
-// and monotonic until rekeying to avoid any replay attack.
 //
 // The first byte of KeyID (which is the high order byte since we adopt
 // BigEndian network byte order) is also used as a protocol version number
 // to ensure that anytime a protocol change is made, all systems update
 // keys as well as software. A client KeyID has low bit zero and the matching
 // server KeyID has low bit one, ensuring that KeyID+seqno is unique
-// and preventing packet replay confusion between client and server.
+// and providing some defense-in-depth against confusion between client and server.
 // After clearing that bit, client and server are using the same encryption key.
+//
+// Packet sequence numbers, "seqno", are independent for sender and receiver
+// and monotonic until rekeying, as defense-in-depth against replay attacks.
+// To avoid client counter storage, Dial uses time.UnixMilli for replay
+// protection and initializes seqno based on reply from server. 
 //
 // The ack value is the packet sender's rcv.w, which is the seqno
 // the sender is awaiting from the other side, one higher
@@ -34,8 +37,8 @@ package puckfs
 // Possibly we should use pure text rather than a binary format like this, but
 // we don't want protocol compilers, JIT, reflection, or large parsers.
 //
-// Someday clients may be mobile, so perhaps best identified by KeyID, with
-// IP addr regarded as a hint of where to reply. But leave that for later.
+// Clients are identified by KeyID and may be mobile, with
+// IP addr regarded as a hint of where to reply.
 // My server has a static IP address, which I like to use explicitly in the secretFile
 // to avoid DNS troubles, but do as you like.
 //
@@ -53,8 +56,10 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"golang.org/x/crypto/chacha20poly1305"
@@ -64,19 +69,21 @@ import (
 type secretFile struct {
 	DEBUG      bool
 	MTU        int    // largest payload size we will send
-	PktCnt     string // name of file for snd.w, rcv.w
+	PktCnt     string // name of file on server for greetings, snd.w, rcv.w
 	KeyID      uint32 // unique to (client,server)-pair
 	Secret     string // "chacha20poly1305:"+base64.StdEncoding.EncodeToString(secret)
 	ServerAddr string // host:port on network "udp"
 }
 
-// PuckFS holds the parsed secretFile and ring buffers for the network connection.
+// PuckFS holds crypto and ring buffers for the network connection.
 type PuckFS struct {
 	snd    ringBuf     // unack'd packets   snd.val=ciphertext including nonce
 	rcv    ringBuf     // undeliv'd packets   rcv.val=plaintext cmd+data
 	aead   cipher.AEAD // xchacha20poly1305
 	sec    *secretFile
-	caller *net.UDPAddr // for client, caller==nil; for server, init &unsetCaller
+	serverside bool
+	greetings int64 // time.UnixMilli at client for most recent Hello
+	caller *net.UDPAddr
 	udp    *net.UDPConn // handle for reading and writing packets
 	dropcnt	int // client bails out if too many dropped packets
 }
@@ -84,7 +91,7 @@ type PuckFS struct {
 const (
 	puckfsVERSION = 3
 	maxPayload    = 1500    // Largest MTU that the other side might have chosen.
-	ringN         = 1 << 5   // TODO was 12   // max cmd payload < MTU*ringN
+	ringN         = 1 << 5   // max cmd payload < MTU*ringN
 	minPacketlen  = 8 + 24 + 4 + 2 + 16
 )
 
@@ -102,10 +109,9 @@ const (
 
 var cmdNames = []string{"Ack", "Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir"}
-var unsetCaller net.UDPAddr
 var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
-var sendTimeout = time.Duration(10e9) // 10 sec
+var sendTimeout = time.Duration(2e9) // 2 sec
 var noDeadline time.Time
 
 // ClientRPC sends scmd+req and then reads rcmd+resp. Errors are returned in rcmd.
@@ -127,7 +133,7 @@ func (p *PuckFS) clientRPC(scmd uint16, req []byte) (rcmd uint16, resp []byte) {
 
 // Send a command, if necessary as multiple packets.
 func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
-	var ad, plaintext []byte
+	var ciphertext []byte
 	if p.sec.DEBUG {
 		log.Printf("sendCmd %s[%d] seqno=%d await %d", cmdNames[cmd], len(data), p.snd.w, p.rcv.w)
 	}
@@ -149,14 +155,7 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 				log.Printf("  cmd=%s data=%q", cmdNames[cmd], data)
 			}
 		}
-		ad, plaintext, data = p.marshal(cmd, data)
-		ciphertext := make([]byte, 0, len(ad)+24+len(plaintext)+16)
-		ciphertext = append(ciphertext, ad...)
-		n := len(ad)
-		nonce := ciphertext[n : n+24]
-		rand.Read(nonce)
-		ciphertext = p.aead.Seal(ciphertext[:n+24], nonce, plaintext, ad)
-		err = p.write(ciphertext)
+		data, ciphertext, err = p.bareCmd(cmd, data)
 		if err != nil {
 			return
 		}
@@ -171,6 +170,20 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 		}
 	}
 	return
+}
+
+// Just send the command packet; no buffering.
+func (p *PuckFS) bareCmd(cmd uint16, data []byte) ([]byte, []byte, error) {
+	var ad, plaintext []byte
+	ad, plaintext, data = p.marshal(cmd, data)
+	ciphertext := make([]byte, 0, len(ad)+24+len(plaintext)+16)
+	ciphertext = append(ciphertext, ad...)
+	n := len(ad)
+	nonce := ciphertext[n : n+24]
+	rand.Read(nonce)
+	ciphertext = p.aead.Seal(ciphertext[:n+24], nonce, plaintext, ad)
+	err := p.write(ciphertext)
+	return data, ciphertext, err
 }
 
 // Send a lightweight Ack packet; no need for retransmit or ack. Don't advance p.snd.
@@ -280,19 +293,69 @@ func (p *PuckFS) readPacket() error {
 		seqno = binary.BigEndian.Uint32(ad[4:8])
 		plaintext, err = p.aead.Open(plaintext[:0], ciphertext[:24], ciphertext[24:], ad)
 		if err != nil {
-			log.Fatal("decrypt failed! Do not use any partial results.")
+			log.Printf("decrypt failed! Do not use any partial results.")
+			return errBye
 		}
 		break
 	}
 	p.udp.SetReadDeadline(noDeadline)
 	ack := binary.BigEndian.Uint32(plaintext[0:4])
 	cmd := binary.BigEndian.Uint16(plaintext[4:6])
+	req := plaintext[6:]
 	if p.sec.DEBUG {
 		log.Printf("  readPacket seqno=%d ack=%d %s", seqno, ack, cmdNames[cmd])
 	}
-	p.callerSet(cmd, caller)
+	if p.serverside {
+		p.caller = caller
+	}
+	if cmd == cHello {
+		// acks aren't synchronized yet, so handle this specially
+		var sw, rw uint32
+		if !p.serverside {
+			n, err := fmt.Sscanf(string(req), "%d %d", &sw, &rw)
+			if n != 2 {
+				return err
+			}
+			p.snd.w = sw
+			p.snd.r = p.snd.w
+			p.rcv.w = rw+1 // account for server sending a cHello seqno
+			p.rcv.r = p.rcv.w
+			if p.sec.DEBUG {
+				log.Printf("initialized %s",p.packetCounters())
+			}
+			return nil
+		}
+		now := time.Now().UnixMilli()
+		there, err := strconv.ParseInt(string(req), 10, 64)
+		if err != nil {
+			log.Printf("invalid time in %s: %s", req, err)
+			return nil // just ignore it
+		}
+		delta := float64(now-there)/1000.
+		if math.Abs(delta) > 10. {
+			log.Printf("server %d, client %dms;" +
+				" surely can do better\n", now, there)
+			return nil // just ignore it
+		}
+		if there <= p.greetings {
+			log.Printf("client sent %dms;" +
+				" previously had %d\n", there, p.greetings)
+			return nil // just ignore it
+		}
+		p.greetings = there
+		p.WritePktCnt()
+		resp := []byte{}
+		resp = fmt.Appendf(resp, "%d %d", p.rcv.w, p.snd.w)
+		if err = p.sendCmd(cHello, resp); err != nil {
+			log.Printf("cHello err %v", err)
+			p.Close()
+			return err
+		}
+		log.Print("Hello")
+		return nil
+	}
 	if ack > p.snd.w {
-		log.Printf("got ack %d for packet never sent; wanted at most %d", ack, p.snd.w)
+		log.Printf("got ack %d; wanted at most %d", ack, p.snd.w)
 		// return p.bail(seqno, ack)
 		return nil // ignore; probably from an old connection
 	}
@@ -308,8 +371,7 @@ func (p *PuckFS) readPacket() error {
 		log.Printf("dropping out-of-sequence packet %s %d %s",
 			cmdNames[cmd], seqno, p.packetCounters())
 		p.dropcnt++
-		if p.dropcnt > 20 && p.caller == nil {
-			p.WritePktCnt()
+		if p.dropcnt > ringN+10 && !p.serverside {
 			log.Fatal("too many drops in a row, bailing out")
 		}
 		if err := p.sendAck(); err != nil {
@@ -317,12 +379,13 @@ func (p *PuckFS) readPacket() error {
 		}
 		return nil
 	}
-	p.dropcnt = 0 // got a valid packet, so hope network recovered
+	p.dropcnt = 0 // got a valid packet, so presumably network recovered
 	if cmd == cAck { // special lightweight packet; don't advance p.rcv.
 		return nil
 	}
-	if ok := p.rcv.push(plaintext[4:], noDeadline); !ok { // Ignore if we don't have room to save.
-		log.Printf("Other side should wait for acks. %d %s", seqno, p.packetCounters())
+	if ok := p.rcv.push(plaintext[4:], noDeadline); !ok {
+		// Ignore if we don't have room to save.
+		log.Printf("wait for acks %d %s", seqno, p.packetCounters())
 		return nil
 	}
 	return nil
@@ -351,10 +414,10 @@ func (p *PuckFS) read(buf []byte) ([]byte, *net.UDPAddr, error) {
 	var err error
 	var n int
 	var caller *net.UDPAddr
-	if p.caller == nil {
-		n, err = p.udp.Read(buf)
-	} else {
+	if p.serverside {
 		n, caller, err = p.udp.ReadFromUDP(buf)
+	} else {
+		n, err = p.udp.Read(buf)
 	}
 	ciphertext := buf[:n]
 	if err != nil {
@@ -370,10 +433,10 @@ func (p *PuckFS) read(buf []byte) ([]byte, *net.UDPAddr, error) {
 // Low-level write to the network.
 func (p *PuckFS) write(ciphertext []byte) (err error) {
 	var nw int
-	if p.caller == nil {
-		nw, err = p.udp.Write(ciphertext)
-	} else {
+	if p.serverside {
 		nw, err = p.udp.WriteToUDP(ciphertext, p.caller)
+	} else {
+		nw, err = p.udp.Write(ciphertext)
 	}
 	if nw != len(ciphertext) {
 		log.Printf("!!!  short write; got %d, wanted %d", nw, len(ciphertext))
@@ -382,26 +445,6 @@ func (p *PuckFS) write(ciphertext []byte) (err error) {
 		log.Fatalf("!!!  can't happen? udp.Write %s", err)
 	}
 	return
-}
-
-// If server receives a validated cHello, remember caller's address.
-func (p *PuckFS) callerSet(cmd uint16, caller *net.UDPAddr) {
-	if p.caller == nil {
-		// If nil, we're a client. And we already know the server's address.
-		return
-	}
-	if cmd != cHello {
-		return // callerSet is only relevant for first packet of connection from client.
-	}
-	if p.caller == &unsetCaller {
-		p.caller = caller
-	} else if p.caller == caller {
-		log.Fatal("Perhaps our earlier cHello reply to the client was lost? Unable to recover.")
-	} else {
-		log.Printf("cHello while still listening for a client that didn't Bye.")
-		p.Close() // Let's assume the old client crashed and let's try to proceed...
-		p.caller = caller
-	}
 }
 
 // Copy (part of) msg into plaintext, prefixed by 6 bytes of ack+cmd.
@@ -424,22 +467,6 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (ad, plaintext, unread []byte) 
 	copy(plaintext[6:], msg[:n])
 	return ad, plaintext, msg[n:]
 }
-
-// // Try to recover from stale counters.
-// func (p *PuckFS) bail(seqno, ack uint32) error {
-// 	log.Printf("Probably we failed earlier while saving our counters; bailing.")
-// 	p.snd.w = ack
-// 	for ok := true; ok; _, ok = p.snd.pop() {
-// 		// Discard until buffer is empty.
-// 	}
-// 	p.rcv.w = seqno + 1
-// 	for ok := true; ok; _, ok = p.rcv.pop() {
-// 		// Discard until buffer is empty.
-// 	}
-// 	log.Printf("forced %d %d %d %d", p.snd.r, p.snd.w, p.rcv.r, p.rcv.w)
-// 	p.Close()
-// 	return errBye
-// }
 
 func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error) {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -474,22 +501,7 @@ func readSecretFile(secretfile string) (addr *net.UDPAddr, p *PuckFS, err error)
 	}
 	snd := ringBuf{0, 0, [ringN][]byte{}, [ringN]time.Time{}}
 	rcv := ringBuf{0, 0, [ringN][]byte{}, [ringN]time.Time{}}
-	if data, err = os.ReadFile(sec.PktCnt); err != nil {
-		return addr, p, err
-	}
-	var sw, rw uint32
-	n, err := fmt.Sscanf(string(data), "%d %d", &sw, &rw)
-	if n != 2 || err != nil {
-		log.Fatalf("unable to parse %s: %d %v", sec.PktCnt, n, err)
-	}
-	if sw > uint32(1<<29) || rw > uint32(1<<29) {
-		log.Print("time to rekey; PktCnt getting large") // I doubt I'll ever get this.
-	}
-	snd.r = sw
-	snd.w = sw
-	rcv.r = rw
-	rcv.w = rw
-	puckfs := PuckFS{snd, rcv, aead, &sec, &unsetCaller, nil, 0}
+	puckfs := PuckFS{snd, rcv, aead, &sec, false, 0, nil, nil, 0}
 	return addr, &puckfs, nil
 }
 

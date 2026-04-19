@@ -1,0 +1,32 @@
+Sonnet 4.6
+❯ This client-server combination runs on two trusted machines connected by an untrusted network. Do you see any vulnerabilities?                                                                     
+
+  Security Review: puckfs                                                                                                                                                                            
+                                                                                                                                                                                                     
+  Overall finding: No high-confidence vulnerabilities. The code is well-designed for its threat model. Here's the detailed analysis:                                                                 
+                                                                                                                                                                                                     
+  What's done correctly                                                                                                                                                                              
+                                                                                                                                                                                                     
+  Cryptography: XChaCha20-Poly1305 AEAD is properly applied. The 192-bit nonce is randomly generated per packet (rand.Read(nonce) in bareCmd/sendAck). The KeyID is included in the authenticated    
+  Associated Data, so any tampering with the header causes AEAD failure and packet discard. An on-path attacker cannot forge or tamper with packets.                                                 
+                                                                                                                                                                                                     
+  Replay protection: Sequence numbers are monotonically increasing and checked at internal.go:370 (seqno != p.rcv.w). They're persisted to disk so a server restart doesn't reset the window. The    
+  Hello handshake uses millisecond timestamps with a strict monotonic check (there <= p.greetings, serverAPI.go:340) so old Hello packets can't be replayed.
+                                                                                                                                                                                                     
+  Path traversal: fs.ValidPath (used in both extractFilename and the cReaddir handler) correctly rejects absolute paths, .. components, and empty segments. A client cannot escape the server's      
+  working directory.
+                                                                                                                                                                                                     
+  Caller address update: p.caller = caller happens only after successful AEAD decryption (internal.go:308–309), so an unauthenticated attacker can't redirect replies to themselves.                 
+   
+  Minor observations (not exploitable)                                                                                                                                                               
+                  
+  - WritePktCnt lacks O_TRUNC (serverAPI.go:208): Stale bytes could remain if the new content is shorter. In practice this won't happen because all three values (greetings, snd.w, rcv.w) are       
+  monotonically increasing, and fmt.Sscanf stops after parsing the first three integers anyway, ignoring any tail.
+  - No forward secrecy: Compromise of the shared secret retroactively decrypts all traffic. This is a design choice appropriate for your stated deployment model.                                    
+  - cReaddir with empty req (serverAPI.go:112): file[len(file)-1] would panic if the client sends a zero-length dirname. This is a crash (DoS), not a privilege escalation — and only reachable by   
+  the authenticated client.                                                                                                                                                                          
+                                                                                                                                                                                                     
+  The channel security is solid. The main residual risk is operational: whoever holds the secret file on either machine has full read/write access to the server's working directory, so secret file 
+  protection is the critical control.
+                                                                                                                                                                                                     
+✻ Sautéed for 2m 24s                  

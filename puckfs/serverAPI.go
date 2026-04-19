@@ -1,4 +1,4 @@
-// Copyright © 2020,2025 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020,2025,2026 Eric Grosse n2vi.com/0BSD
 
 package puckfs
 
@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
-	"math"
 	"net"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 func Listen() (p *PuckFS) {
@@ -30,9 +28,11 @@ func Listen() (p *PuckFS) {
 	if addr, p, err = readSecretFile(secretfile); err != nil {
 		log.Fatalf("euid %d readSecretFile returned %v", os.Geteuid(), err)
 	}
+	p.serverside = true
 	if p.sec.KeyID&1 != 1 { // can't happen except by catastrophic blunder
 		log.Fatal("wanted KeyID for server, got client")
 	}
+	p.readPktCnt()
 	if p.udp, err = net.ListenUDP("udp", addr); err != nil {
 		log.Fatalf("net.ListenUDP returned %v", err)
 	}
@@ -59,28 +59,8 @@ func (p *PuckFS) HandleRPC() {
 		var file string
 		switch cmd {
 		case cHello:
-			now := time.Now().UTC()
-			there, err := time.Parse(time.RFC3339, string(req))
-			if err != nil {
-				log.Printf("invalid time format in %s: %s", string(req), err)
-				reject(p, cHello, "invalid time format")
-				continue
-			}
-			delta := now.Sub(there).Seconds()
-			if math.Abs(delta) > 10. {
-				log.Printf("server %s, client %s\n", now.String(), there.String())
-				reject(p, cHello, "clocks can surely be better calibrated than 10sec?")
-				continue
-			}
-			if math.Abs(delta) > 2. {
-				resp = fmt.Appendf(nil, "%.0f", delta)
-			}
-			if err = p.sendCmd(cHello, resp); err != nil {
-				log.Printf("cHello err %v", err)
-				p.Close()
-				return
-			}
-			log.Print("Hello")
+			log.Print("Hello is special-cased in readPacket().")
+			continue
 		case cReadfile:
 			if file, req, err = extractFilename(req); err != nil {
 				reject(p, cError, "bad filename")
@@ -201,5 +181,39 @@ func reject(p *PuckFS, cmd uint16, mess string) {
 	log.Printf("rejected %x %s", cmd, mess)
 	if err = p.sendCmd(cmd, []byte(mess)); err != nil {
 		log.Fatalf("unable to even send rejection %v", err)
+	}
+}
+
+func (p *PuckFS) readPktCnt() error {
+	data, err := os.ReadFile(p.sec.PktCnt)
+	if err != nil {
+		return err
+	}
+	var sw, rw uint32
+	n, err := fmt.Sscanf(string(data), "%d %d %d", &p.greetings, &sw, &rw)
+	if n != 3 || err != nil {
+		log.Fatalf("unable to parse %s: %d %v", p.sec.PktCnt, n, err)
+	}
+	if sw > uint32(1<<29) || rw > uint32(1<<29) {
+		log.Print("time to rekey; PktCnt getting large") // I doubt I'll ever get this.
+	}
+	p.snd.r = sw
+	p.snd.w = sw
+	p.rcv.r = rw
+	p.rcv.w = rw
+	return err
+}
+
+func (p *PuckFS) WritePktCnt() {
+	f, err := os.OpenFile(p.sec.PktCnt, os.O_RDWR, 0600)
+	if err != nil {
+		log.Printf("%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+		log.Fatal(err)
+	}
+	fmt.Fprintf(f, "%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+	err = f.Close()
+	if err != nil {
+		log.Printf("%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+		log.Fatal(err)
 	}
 }
