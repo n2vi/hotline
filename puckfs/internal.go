@@ -111,7 +111,7 @@ var cmdNames = []string{"Ack", "Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir"}
 var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
-var sendTimeout = time.Duration(2e9) // 2 sec
+var sendTimeout = time.Duration(200e6) // 200 millisec
 var noDeadline time.Time
 
 // ClientRPC sends scmd+req and then reads rcmd+resp. Errors are returned in rcmd.
@@ -274,7 +274,7 @@ func (p *PuckFS) readPacket() error {
 					log.Printf("deadline")
 				}
 				p.retransmit()
-				p.udp.SetReadDeadline(time.Now().Add(4 * sendTimeout))
+				p.udp.SetReadDeadline(time.Now().Add(2 * sendTimeout))
 				continue
 			}
 			p.udp.SetReadDeadline(noDeadline)
@@ -393,20 +393,6 @@ func (p *PuckFS) readPacket() error {
 
 func (p *PuckFS) packetCounters() string {
 	return fmt.Sprintf("next %d pend %d await %d", p.snd.w, p.snd.w-p.snd.r, p.rcv.w)
-}
-
-// Check if oldest retransmit deadline has expired and, if so, resend.
-func (p *PuckFS) retransmit() {
-	old, t, expired := p.snd.timeout()
-	if expired {
-		if p.sec.DEBUG {
-			log.Printf("retransmit seqno=%d", p.snd.r)
-		}
-		if p.write(old) != nil {
-			return
-		}
-		*t = time.Now().Add(sendTimeout)
-	}
 }
 
 // Low-level read from network.
@@ -558,12 +544,29 @@ func (ringBuf *ringBuf) pop() (val []byte, ok bool) {
 	return val, true
 }
 
+// Check if oldest retransmit deadline has expired and, if so, resend all.
+func (p *PuckFS) retransmit() {
+	t, expired := p.snd.timeout()
+	if expired {
+		if p.sec.DEBUG {
+			log.Printf("retransmit seqno=%d..%d", p.snd.r, p.snd.w-1)
+		}
+		for j := p.snd.r; j < p.snd.w; j++ {
+			jj := j & (ringN - 1)
+			if p.write(p.snd.p[jj]) != nil {
+				return
+			}
+		}
+		*t = time.Now().Add(sendTimeout)
+	}
+}
+
 // Return data, timeout slot, and status for oldest packet in ringBuf.
-func (ringBuf *ringBuf) timeout() (data []byte, t *time.Time, expired bool) {
+func (ringBuf *ringBuf) timeout() (t *time.Time, expired bool) {
 	if ringBuf.empty() {
-		return nil, nil, false
+		return nil, false
 	}
 	now := time.Now()
 	j := ringBuf.r & (ringN - 1)
-	return ringBuf.p[j], &ringBuf.t[j], now.After(ringBuf.t[j])
+	return &ringBuf.t[j], now.After(ringBuf.t[j])
 }
