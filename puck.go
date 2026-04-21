@@ -1,4 +1,4 @@
-// Copyright (c) 2020,2022,2025 Eric Grosse n2vi.com/0BSD
+// Copyright (c) 2020,2022,2025,2026 Eric Grosse n2vi.com/0BSD
 
 /*
 Command hotline implements a simple e2e encrypted chat.
@@ -22,6 +22,10 @@ and messages and inside that directory:
 	tar xf yourpuck.tar
 	hotline rekey eric randomstringwepick
 
+Then you'll generate and publish an MLKEM public key
+and we'll rotate the secret another time, finally
+bootstrapping to something I'm betting is secure.
+
 Just working out ideas here; don't consider this final.
 Comments welcome to grosse@gmail.com.
 */
@@ -29,8 +33,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/mlkem"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/sha3"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -51,6 +59,8 @@ import (
 
 type PrincipalsDB struct {
 	Me    ID // my (puck's) identity
+	MLKEMsecret []byte // 64-byte seed
+	MLKEMpubhash string // base64(sha256(MLKEMpub))
 	Peers []*Principal
 }
 type ID uint32 // static, globally-unique identifier of a principal
@@ -59,6 +69,9 @@ type Principal struct {
 	Id        ID     // my peer's identity
 	Nick      string // private, local reminder of who this is
 	Note      string // updated where, when, how, by whom
+	MLKEMpub  []byte // 1184-byte public key
+	MLKEMdk   []byte // 64-byte ephemeral rekey secret
+	MLKEMss   []byte // shared secret
 	My, Their Key
 	// myRouting, theirRouting Routing
 }
@@ -534,7 +547,7 @@ func main2() (err error) {
 		nick[p.Id] = p.Nick
 		nickP[p.Nick] = &p
 		keyP[p.Their.KeyID] = &p
-		err = saveDB()
+		_ = saveDB()
 		// next step will be face-to-face "rekey" to overwrite the random values
 	case "l", "list": // Show all saved messages, sent or received.
 		initialLoad()
@@ -559,15 +572,178 @@ func main2() (err error) {
 			}
 			fmt.Printf("%s %s %s%s%s %q\n", msg.fn, t, dir, correspondent, ellipsis, msg.Body[:j])
 		}
+	case "mlkem-gen":
+		// As another rekey experiment, we attempt secure symmetric key
+		// establishment at a distance using ML-KEM 768 public keys
+		// and using the mutually authenticated algorithm of Figure 11 from
+		// NIST SP 800-227 section 5.2.5.
+		if len(os.Args) != 2 {
+			return errors.New("usage: hotline mlkem-gen > MLKEMpub")
+		}
+		initialLoad()
+		dk, err := mlkem.GenerateKey768()
+		db.MLKEMsecret = dk.Bytes()
+		MLKEMpub := dk.EncapsulationKey().Bytes()
+		s := sha256.Sum256(MLKEMpub)
+		db.MLKEMpubhash = base64.StdEncoding.EncodeToString(s[:])
+		_ = saveDB()
+		_, err = os.Stdout.Write(MLKEMpub)
+		if err != nil {
+			log.Fatalf("write stdout failed? %s", err)
+		}
+	case "mlkem-pub":
+		if len(os.Args) != 3 {
+			return errors.New("usage: hotline mlkem-pub eric < MLKEMpub")
+		}
+		initialLoad()
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("failed read stdin: %s", err)
+		}
+		if len(b) != mlkem.EncapsulationKeySize768 {
+			return fmt.Errorf("read %d, expected 1184", len(b))
+		}
+		p.MLKEMpub = b
+		_ = saveDB()
+		s := sha256.Sum256(p.MLKEMpub)
+		fmt.Printf("confirm %s", base64.StdEncoding.EncodeToString(s[:]))
+	case "mlkem-chal":
+		if len(os.Args) != 3 {
+			return errors.New("usage: hotline mlkem-chal eric > MLKEMchal")
+		}
+		initialLoad()
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		dk, err := mlkem.GenerateKey768()
+		p.MLKEMdk = dk.Bytes()
+		ekbytes := dk.EncapsulationKey().Bytes()
+		_, err = os.Stdout.Write(ekbytes)
+		if err != nil {
+			log.Fatalf("write stdout failed? %s", err)
+		}
+		ekb, err := mlkem.NewEncapsulationKey768(p.MLKEMpub)
+		if err != nil {
+			return fmt.Errorf("failed to parse EncapsulationKey: %s", err)
+		}
+		kb, cb := ekb.Encapsulate()
+		_, err = os.Stdout.Write(cb)
+		if err != nil {
+			log.Fatalf("write stdout failed? %s", err)
+		}
+		p.MLKEMss = kb
+		_ = saveDB()
+	case "mlkem-resp":
+		if len(os.Args) != 3 {
+			return errors.New("usage: hotline mlkem-resp eric < MLKEMchal > MLKEMresp")
+		}
+		initialLoad()
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("failed read stdin: %s", err)
+		}
+		if len(b) != mlkem.EncapsulationKeySize768 + mlkem.CiphertextSize768 {
+			return fmt.Errorf("read %d, expected 2272", len(b))
+		}
+		ek, err := mlkem.NewEncapsulationKey768(b[:mlkem.EncapsulationKeySize768])
+		if err != nil {
+			return fmt.Errorf("failed to parse EncapsulationKey: %s", err)
+		}
+		cb := b[mlkem.EncapsulationKeySize768:]
+		ke, ce := ek.Encapsulate()
+		eka, err := mlkem.NewEncapsulationKey768(p.MLKEMpub)
+		if err != nil {
+			return fmt.Errorf("failed to parse EncapsulationKey: %s", err)
+		}
+		ka, ca := eka.Encapsulate()
+		dk, err := mlkem.NewDecapsulationKey768(db.MLKEMsecret)
+		if err != nil {
+			return fmt.Errorf("failed to parse DecapsulationKey seed: %s", err)
+		}
+		kb, err := dk.Decapsulate(cb)
+		if err != nil {
+			return fmt.Errorf("Decapsulation failed: %s", err)
+		}
+		_, err = os.Stdout.Write(ce)
+		if err != nil {
+			log.Fatalf("write stdout failed? %s", err)
+		}
+		_, err = os.Stdout.Write(ca)
+		if err != nil {
+			log.Fatalf("write stdout failed? %s", err)
+		}
+		h := sha3.New512()
+		_, err1 := h.Write(ke)
+		_, err2 := h.Write(ka)
+		_, err3 := h.Write(kb)
+		if err1!=nil || err2!=nil || err3!=nil {
+			log.Fatalf("sha3 failure: %s %s %s", err1, err2, err3)
+		}
+		p.MLKEMss = h.Sum(nil)
+		_ = saveDB()
+	case "mlkem-shared":
+		if len(os.Args) != 3 {
+			return errors.New("usage: hotline mlkem-shared eric < MLKEMresp")
+		}
+		initialLoad()
+		p, ok := nickP[os.Args[2]]
+		if !ok {
+			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
+		}
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return fmt.Errorf("failed read stdin: %s", err)
+		}
+		if len(b) != 2*mlkem.CiphertextSize768 {
+			return fmt.Errorf("read %d, expected 2176", len(b))
+		}
+		ce := b[:mlkem.CiphertextSize768]
+		ca := b[mlkem.CiphertextSize768:]
+		dk, err := mlkem.NewDecapsulationKey768(p.MLKEMdk)
+		if err != nil {
+			return fmt.Errorf("failed to parse DecapsulationKey seed: %s", err)
+		}
+		ke, err := dk.Decapsulate(ce)
+		if err != nil {
+			return fmt.Errorf("Decapsulation failed: %s", err)
+		}
+		dk, err = mlkem.NewDecapsulationKey768(db.MLKEMsecret)
+		if err != nil {
+			return fmt.Errorf("failed to parse DecapsulationKey seed: %s", err)
+		}
+		ka, err := dk.Decapsulate(ca)
+		if err != nil {
+			return fmt.Errorf("Decapsulation failed: %s", err)
+		}
+		kb := p.MLKEMss
+		h := sha3.New512()
+		_, err1 := h.Write(ke)
+		_, err2 := h.Write(ka)
+		_, err3 := h.Write(kb)
+		if err1!=nil || err2!=nil || err3!=nil {
+			log.Fatalf("sha3 failure: %s %s %s", err1, err2, err3)
+		}
+		p.MLKEMss = h.Sum(nil)
+		p.MLKEMdk = nil // no longer need ephemeral key
+		_ = saveDB()
 	case "rekey":
 		// This is an experiment in how to set or reset the keys for a pair of
 		// principals. It has the advantage that the Puck never needs to listen
 		// on a port, unlike face-to-face ethernet. But it is not a general solution
 		// because random strings are awkward to type and not really random.
-		initialLoad()
 		if len(os.Args) != 4 {
 			return errors.New("usage: hotline rekey eric 'random string'")
 		}
+		initialLoad()
 		p, ok := nickP[os.Args[2]]
 		if !ok {
 			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
@@ -592,7 +768,7 @@ func main2() (err error) {
 		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.Their.KeyAlg = 2 // xchacha20poly1305
 		copy(p.Their.Secret, sum[4:36])
-		err = saveDB()
+		_ = saveDB()
 	case "s", "send":
 		initialLoad()
 		b, err := io.ReadAll(os.Stdin)
