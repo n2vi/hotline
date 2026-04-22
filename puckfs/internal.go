@@ -305,9 +305,6 @@ func (p *PuckFS) readPacket() error {
 	if p.sec.DEBUG {
 		log.Printf("  readPacket seqno=%d ack=%d %s", seqno, ack, cmdNames[cmd])
 	}
-	if p.serverside {
-		p.caller = caller
-	}
 	if cmd == cHello {
 		// acks aren't synchronized yet, so handle this specially
 		var sw, rw uint32
@@ -342,6 +339,7 @@ func (p *PuckFS) readPacket() error {
 				" previously had %d\n", there, p.greetings)
 			return nil // just ignore it
 		}
+		p.caller = caller
 		p.greetings = there
 		p.WritePktCnt()
 		resp := []byte{}
@@ -358,6 +356,9 @@ func (p *PuckFS) readPacket() error {
 		log.Printf("got ack %d; wanted at most %d", ack, p.snd.w)
 		// return p.bail(seqno, ack)
 		return nil // ignore; probably from an old connection
+	}
+	if p.serverside {
+		p.caller = caller
 	}
 	for ack > p.snd.r { // Release acknowledged packets.
 		if _, ok := p.snd.pop(); !ok {
