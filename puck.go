@@ -547,7 +547,10 @@ func main2() (err error) {
 		nick[p.Id] = p.Nick
 		nickP[p.Nick] = &p
 		keyP[p.Their.KeyID] = &p
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 		// next step will be face-to-face "rekey" to overwrite the random values
 	case "l", "list": // Show all saved messages, sent or received.
 		initialLoad()
@@ -582,11 +585,17 @@ func main2() (err error) {
 		}
 		initialLoad()
 		dk, err := mlkem.GenerateKey768()
+		if err != nil {
+			log.Fatalf("mlkem.GenerateKey768 failed? %s", err)
+		}
 		db.MLKEMsecret = dk.Bytes()
 		MLKEMpub := dk.EncapsulationKey().Bytes()
 		s := sha256.Sum256(MLKEMpub)
 		db.MLKEMpubhash = base64.StdEncoding.EncodeToString(s[:])
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 		_, err = os.Stdout.Write(MLKEMpub)
 		if err != nil {
 			log.Fatalf("write stdout failed? %s", err)
@@ -608,7 +617,10 @@ func main2() (err error) {
 			return fmt.Errorf("read %d, expected 1184", len(b))
 		}
 		p.MLKEMpub = b
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 		s := sha256.Sum256(p.MLKEMpub)
 		fmt.Printf("confirm %s", base64.StdEncoding.EncodeToString(s[:]))
 	case "mlkem-chal":
@@ -621,6 +633,9 @@ func main2() (err error) {
 			return fmt.Errorf("unrecognized nickname %s", os.Args[2])
 		}
 		dk, err := mlkem.GenerateKey768()
+		if err != nil {
+			log.Fatalf("mlkem.GenerateKey768 failed? %s", err)
+		}
 		p.MLKEMdk = dk.Bytes()
 		ekbytes := dk.EncapsulationKey().Bytes()
 		_, err = os.Stdout.Write(ekbytes)
@@ -637,7 +652,10 @@ func main2() (err error) {
 			log.Fatalf("write stdout failed? %s", err)
 		}
 		p.MLKEMss = kb
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 	case "mlkem-resp":
 		if len(os.Args) != 3 {
 			return errors.New("usage: hotline mlkem-resp eric < MLKEMchal > MLKEMresp")
@@ -689,7 +707,10 @@ func main2() (err error) {
 			log.Fatalf("sha3 failure: %s %s %s", err1, err2, err3)
 		}
 		p.MLKEMss = h.Sum(nil)
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 	case "mlkem-shared":
 		if len(os.Args) != 3 {
 			return errors.New("usage: hotline mlkem-shared eric < MLKEMresp")
@@ -732,9 +753,13 @@ func main2() (err error) {
 		if err1!=nil || err2!=nil || err3!=nil {
 			log.Fatalf("sha3 failure: %s %s %s", err1, err2, err3)
 		}
+		// TODO  Opus4.7 suggests we should also include the ek and c values here.
 		p.MLKEMss = h.Sum(nil)
 		p.MLKEMdk = nil // no longer need ephemeral key
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 	case "rekey":
 		// This is an experiment in how to set or reset the keys for a pair of
 		// principals. It has the advantage that the Puck never needs to listen
@@ -768,7 +793,10 @@ func main2() (err error) {
 		p.Their.KeyID = binary.BigEndian.Uint32(sum[0:4])
 		p.Their.KeyAlg = 2 // xchacha20poly1305
 		copy(p.Their.Secret, sum[4:36])
-		_ = saveDB()
+		err = saveDB()
+		if err != nil {
+			log.Fatalf("PrincipalsDB not updated: %s", err)
+		}
 	case "s", "send":
 		initialLoad()
 		b, err := io.ReadAll(os.Stdin)
