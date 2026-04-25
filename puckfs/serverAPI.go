@@ -43,6 +43,10 @@ func Listen() (p *PuckFS) {
 // Puck is a single client which is single threaded, so Broker can handle requests sychronously.
 func (p *PuckFS) HandleRPC() {
 	errCount := 0
+	root, err := os.OpenRoot(".")
+	if err != nil {
+		log.Fatal(err)
+	}
 	for {
 		cmd, req, err := p.readCmd()
 		if err != nil {
@@ -67,7 +71,7 @@ func (p *PuckFS) HandleRPC() {
 				continue
 			}
 			_ = req
-			if resp, err = os.ReadFile(file); err != nil { // open file under local directory
+			if resp, err = root.ReadFile(file); err != nil { // open file under local directory
 				reject(p, cError, err.Error())
 				continue
 			}
@@ -81,7 +85,7 @@ func (p *PuckFS) HandleRPC() {
 				reject(p, cError, "bad filename")
 				continue
 			}
-			if err = os.WriteFile(file, req, 0660); err != nil { // create under local directory
+			if err = root.WriteFile(file, req, 0660); err != nil { // create under local directory
 				reject(p, cError, err.Error())
 				continue
 			}
@@ -96,7 +100,7 @@ func (p *PuckFS) HandleRPC() {
 				continue
 			}
 			_ = req
-			if err = os.Remove(file); err != nil {
+			if err = root.Remove(file); err != nil {
 				reject(p, cError, err.Error())
 				continue
 			}
