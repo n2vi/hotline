@@ -137,9 +137,6 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 	if p.sec.DEBUG {
 		log.Printf("sendCmd %s[%d] seqno=%d await %d", cmdNames[cmd], len(data), p.snd.w, p.rcv.w)
 	}
-	if len(data) > p.sec.MTU*ringN/2 {
-		log.Printf("implausibly large transfer size %d, likely to fail or hang", len(data))
-	}
 	for {
 		for p.snd.full() {
 			if err = p.readPacket(); err != nil {
