@@ -59,6 +59,10 @@ func main() {
 		chk(p, err)
 		err = os.MkdirAll(pathname, 0770)
 		for _, f := range fi {
+			if f.IsDir() {
+				log.Printf("get %s: skipping %s/", pathname, f.Name())
+				continue
+			}
 			fn := pathname + f.Name()
 			data, err := p.ReadFile(fn)
 			chk(p, err)

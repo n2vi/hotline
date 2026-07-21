@@ -132,6 +132,9 @@ func (p *PuckFS) HandleRPC() {
 				if err != nil {
 					continue
 				}
+				if f.Name() == ".DS_Store" {
+					continue // exclude macOS junk
+				}
 				suffix := ""
 				if f.IsDir() {
 					suffix = "/"
