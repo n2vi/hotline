@@ -1,4 +1,4 @@
-// Copyright © 2020,2025,2026 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020-2026 Eric Grosse n2vi.com/0BSD
 
 package puckfs
 
@@ -346,7 +346,7 @@ func (p *PuckFS) readPacket() error {
 			p.Close()
 			return err
 		}
-		log.Print("Hello")
+		log.Printf("Hello from %s", caller)
 		return nil
 	}
 	if ack > p.snd.w {

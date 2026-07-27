@@ -1,4 +1,4 @@
-// Copyright © 2020,2025,2026 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020-2026 Eric Grosse n2vi.com/0BSD
 
 package puckfs
 
@@ -39,6 +39,30 @@ func Listen() (p *PuckFS) {
 	return p
 }
 
+func (p *PuckFS) ServerClose() (err error) {
+	if p.sec.DEBUG {
+		log.Printf("Close")
+	}
+	if p.udp == nil {
+		return errBye
+	}
+	if !p.serverside { // We're not a client!
+		log.Fatal("client close inside server?!!")
+	} else { // Record the call as dropped but keep listening.
+		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
+		p.snd.pop()               // We won't be getting an ack for the reply Bye, but pretend we did.
+		p.caller = nil
+		p.WritePktCnt()
+	}
+	if !p.snd.empty() || !p.rcv.empty() {
+		log.Print("Buffers not empty. Check file *-secret on puck and broker!!!")
+		// discard any pending packets
+		p.snd.r = p.snd.w
+		p.rcv.r = p.rcv.w
+	}
+	return
+}
+
 // HandleRPC is the server main loop for receiving packets and responding.
 // Puck is a single client which is single threaded, so Broker can handle requests sychronously.
 func (p *PuckFS) HandleRPC() {
@@ -52,7 +76,7 @@ func (p *PuckFS) HandleRPC() {
 		if err != nil {
 			if errCount > 3 {
 				log.Printf("%v\ntoo many errors; giving up", err)
-				p.Close()
+				p.ServerClose()
 				return
 			}
 			log.Printf("will retry; readCmd err %v", err)
@@ -64,6 +88,7 @@ func (p *PuckFS) HandleRPC() {
 		switch cmd {
 		case cHello:
 			log.Print("Hello is special-cased in readPacket().")
+			p.WritePktCnt()
 			continue
 		case cReadfile:
 			if file, req, err = extractFilename(req); err != nil {
@@ -77,7 +102,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cReadfile, resp); err != nil {
 				log.Printf("cReadfile err %v", err)
-				p.Close()
+				p.ServerClose()
 				return
 			}
 		case cWritefile:
@@ -91,7 +116,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cWritefile, resp); err != nil {
 				log.Printf("cWritefile sendCmd err %v", err)
-				p.Close()
+				p.ServerClose()
 				return
 			}
 		case cRemove:
@@ -106,7 +131,7 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cRemove, resp); err != nil {
 				log.Printf("cReadfile err %v", err)
-				p.Close()
+				p.ServerClose()
 				return
 			}
 		case cReaddir:
@@ -144,15 +169,15 @@ func (p *PuckFS) HandleRPC() {
 			}
 			if err = p.sendCmd(cReaddir, resp); err != nil {
 				log.Printf("cReaddir err %v", err)
-				p.Close()
+				p.ServerClose()
 				return
 			}
 		case cBye:
-			p.Close()
+			p.ServerClose()
 			log.Print("Bye")
 		default:
 			log.Printf("unrecognized cmd %d; giving up", cmd)
-			p.Close()
+			p.ServerClose()
 			return
 		}
 		// At this point, we've sent our full reply but it may not yet have
@@ -212,15 +237,16 @@ func (p *PuckFS) readPktCnt() error {
 }
 
 func (p *PuckFS) WritePktCnt() {
+	st := fmt.Sprintf("%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
 	f, err := os.OpenFile(p.sec.PktCnt, os.O_RDWR, 0600)
 	if err != nil {
-		log.Printf("%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+		log.Print(st)
 		log.Fatal(err)
 	}
-	fmt.Fprintf(f, "%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+	fmt.Fprint(f, st)
 	err = f.Close()
 	if err != nil {
-		log.Printf("%d %d %d\n", p.greetings, p.snd.w, p.rcv.w)
+		log.Print(st)
 		log.Fatal(err)
 	}
 }

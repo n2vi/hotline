@@ -1,4 +1,4 @@
-// Copyright © 2020,2025, 2026 Eric Grosse n2vi.com/0BSD
+// Copyright © 2020-2026 Eric Grosse n2vi.com/0BSD
 
 /*
 Package puckfs provides a primitive network file server and client,
@@ -8,8 +8,6 @@ package puckfs
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,11 +15,9 @@ import (
 	"net"
 	"strconv"
 	"time"
-
-	"golang.org/x/crypto/chacha20poly1305"
 )
 
-// Dial calls the puckfs server. Doen't deal with lost initial handshake.
+// Dial calls the puckfs server. Doesn't deal with lost initial handshake.
 func Dial(secretfile string) (p *PuckFS, err error) {
 	var addr *net.UDPAddr
 	if addr, p, err = readSecretFile(secretfile); err != nil {
@@ -117,11 +113,8 @@ func (p *PuckFS) Close() (err error) {
 		}
 		_ = p.udp.Close()
 		p.udp = nil
-	} else { // We're a server. Record the call as dropped but keep listening.
-		p.sendCmd(cBye, []byte{}) // No error checking needed here, we're stopping regardless.
-		p.snd.pop()               // We won't be getting an ack for the reply Bye, but pretend we did.
-		p.caller = nil
-		p.WritePktCnt()
+	} else { // We're not a server!
+		log.Fatal("server close inside client?!!")
 	}
 	if !p.snd.empty() || !p.rcv.empty() {
 		log.Print("Buffers not empty. Check file *-secret on puck and broker!!!")
@@ -130,13 +123,6 @@ func (p *PuckFS) Close() (err error) {
 		p.rcv.r = p.rcv.w
 	}
 	return
-}
-
-func Keygen() string {
-	// TODO	Provide rekeying using ML-KEM xor'd with old secret and an optional hashed passphrase.
-	r := make([]byte, chacha20poly1305.KeySize) // 32
-	rand.Read(r)
-	return "chacha20poly1305:" + base64.StdEncoding.EncodeToString(r)
 }
 
 func expect(wanted, got uint16, data []byte) (err error) {
