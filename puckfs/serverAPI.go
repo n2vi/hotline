@@ -88,7 +88,6 @@ func (p *PuckFS) HandleRPC() {
 		switch cmd {
 		case cHello:
 			log.Print("Hello is special-cased in readPacket().")
-			p.WritePktCnt()
 			continue
 		case cReadfile:
 			if file, req, err = extractFilename(req); err != nil {

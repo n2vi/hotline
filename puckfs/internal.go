@@ -91,7 +91,7 @@ type PuckFS struct {
 const (
 	puckfsVERSION = 3
 	maxPayload    = 1500    // Largest MTU that the other side might have chosen.
-	ringN         = 1 << 5   // max cmd payload < MTU*ringN
+	ringN         = 1 << 4   // max cmd payload < MTU*ringN
 	minPacketlen  = 8 + 24 + 4 + 2 + 16
 )
 
@@ -111,7 +111,7 @@ var cmdNames = []string{"Ack", "Partial", "Error", "Bye", "Hello", "Readfile",
 	"Writefile", "Remove", "Readdir"}
 var errBye = errors.New("errBye") // treat like network disconnect
 var errKey = errors.New("wrongKey")
-var sendTimeout = time.Duration(200e6) // 200 millisec
+var sendTimeout = time.Duration(500e6) // 500 millisec
 var noDeadline time.Time
 
 // ClientRPC sends scmd+req and then reads rcmd+resp. Errors are returned in rcmd.
@@ -144,14 +144,16 @@ func (p *PuckFS) sendCmd(cmd uint16, data []byte) (err error) {
 				return
 			}
 		}
-		if p.sec.DEBUG {
-			if len(data) > 300 {
-				log.Printf("  cmd=%s data=%q...%q", cmdNames[cmd], data[:250],
-					data[len(data)-50:])
-			} else {
-				log.Printf("  cmd=%s data=%q", cmdNames[cmd], data)
-			}
-		}
+				/* 
+				if p.sec.DEBUG {
+					if len(data) > 300 {
+						log.Printf("  cmd=%s data=%q...%q", cmdNames[cmd], data[:250],
+							data[len(data)-50:])
+					} else {
+						log.Printf("  cmd=%s data=%q", cmdNames[cmd], data)
+					}
+				}
+				*/
 		data, ciphertext, err = p.bareCmd(cmd, data)
 		if err != nil {
 			return
@@ -183,8 +185,13 @@ func (p *PuckFS) bareCmd(cmd uint16, data []byte) ([]byte, []byte, error) {
 	return data, ciphertext, err
 }
 
+var ackd uint32
+
 // Send a lightweight Ack packet; no need for retransmit or ack. Don't advance p.snd.
 func (p *PuckFS) sendAck() (err error) {
+	if ackd >= p.rcv.w { // only ack once; assume eventually a new packet gets through
+		return
+	}
 	var ad, plaintext []byte
 	if p.sec.DEBUG {
 		log.Printf("sendAck seqno=%d await %d", p.snd.w, p.rcv.w)
@@ -197,6 +204,7 @@ func (p *PuckFS) sendAck() (err error) {
 	nonce := ciphertext[n : n+24]
 	rand.Read(nonce)
 	ciphertext = p.aead.Seal(ciphertext[:n+24], nonce, plaintext, ad)
+	ackd = p.rcv.w
 	err = p.write(ciphertext)
 	return
 }
@@ -225,9 +233,6 @@ func (p *PuckFS) readCmd() (cmd uint16, data []byte, err error) {
 				log.Printf("tried to send Ack: %s", err)
 			}
 			partialcnt = 0
-		}
-		if p.sec.DEBUG {
-			log.Printf("  got {%d} %s", len(sav)-2, p.packetCounters())
 		}
 	}
 	if p.sec.DEBUG {
@@ -366,11 +371,16 @@ func (p *PuckFS) readPacket() error {
 	}
 	p.retransmit()        // Check retransmission timers.
 	if seqno != p.rcv.w { // Ignore out-of-sequence packets.
-		log.Printf("dropping out-of-sequence packet %s %d %s",
-			cmdNames[cmd], seqno, p.packetCounters())
+		if p.sec.DEBUG {
+			log.Printf("out-of-seq %s %d %s",
+				cmdNames[cmd], seqno, p.packetCounters())
+		}
 		p.dropcnt++
-		if p.dropcnt > ringN+10 && !p.serverside {
+		if p.dropcnt > 4*ringN && !p.serverside {
 			log.Fatal("too many drops in a row, bailing out")
+		}
+		if seqno > p.rcv.w { // avoid Ack storm by silently ignoring future packets
+			return nil
 		}
 		if err := p.sendAck(); err != nil {
 			log.Printf("tried to send Ack: %s", err)
@@ -440,9 +450,6 @@ func (p *PuckFS) marshal(cmd uint16, msg []byte) (ad, plaintext, unread []byte) 
 	binary.BigEndian.PutUint32(plaintext[0:4], p.rcv.w) // ack
 	n := len(msg)
 	if n+54 > p.sec.MTU { // Is there room for ad, nonce, ack, cmd, msg and auth tag?
-		if p.sec.DEBUG {
-			log.Printf("  needPartial n=%d MTU=%d\n", n, p.sec.MTU)
-		}
 		cmd = cPartial
 		n = p.sec.MTU - 54
 	}
@@ -542,18 +549,23 @@ func (ringBuf *ringBuf) pop() (val []byte, ok bool) {
 	return val, true
 }
 
-// Check if oldest retransmit deadline has expired and, if so, resend all.
+// Check if oldest retransmit deadline has expired and, if so, resend.
 func (p *PuckFS) retransmit() {
+	lim := 8
 	t, expired := p.snd.timeout()
 	if expired {
 		if p.sec.DEBUG {
-			log.Printf("retransmit seqno=%d..%d", p.snd.r, p.snd.w-1)
+			log.Printf("retransmit up to %d of seqno=%d..%d", lim, p.snd.r, p.snd.w-1)
 		}
 		for j := p.snd.r; j < p.snd.w; j++ {
 			jj := j & (ringN - 1)
 			if p.write(p.snd.p[jj]) != nil {
 				return
 			}
+			if lim <= 0 {
+				break
+			}
+			lim--
 		}
 		*t = time.Now().Add(sendTimeout)
 	}
