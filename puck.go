@@ -1,4 +1,4 @@
-// Copyright (c) 2020,2022,2025,2026 Eric Grosse n2vi.com/0BSD
+// Copyright (c) 2020-2026 Eric Grosse n2vi.com/0BSD
 
 /*
 Command hotline implements a simple e2e encrypted chat.
@@ -14,17 +14,14 @@ end encrypted) message file from one directory to a shared broker.
 
 If you're a fellow hotline developer, I will have already sent you a secret
 file to install in $HOME/.ssh/.puckfs to talk to the broker/ROCCS-simulator
-that I run. Also "echo 0 0 > $HOME/.puckfs" for the initial packet counters.
+that I run.
 If you haven't already, download the hotline source and "go install".
 Then create a directory such as $HOME/puck for your end-to-end secrets
 and messages and inside that directory:
-
 	tar xf yourpuck.tar
 	hotline rekey eric randomstringwepick
-
-Then you'll generate and publish an MLKEM public key
-and we'll rotate the secret another time, finally
-bootstrapping to something I'm betting is secure.
+Then you'll generate and send me an MLKEM public key; we'll rotate the
+secret, finally getting something I bet is secure.
 
 Just working out ideas here; don't consider this final.
 Comments welcome to grosse@gmail.com.
