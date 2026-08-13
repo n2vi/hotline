@@ -96,6 +96,7 @@ var keyP map[ /*KeyID*/ uint32]*Principal
 var Messages []Message
 var MessageCounter int
 var pfs *puckfs.PuckFS
+var cryptotest []byte
 var VERSION [4]byte = [4]byte{0x48, 0x4f, 0x54, 0x33} // "HOT3"
 var errUnmatched = errors.New("unmatched")
 
@@ -104,6 +105,9 @@ var errUnmatched = errors.New("unmatched")
 func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 	var m Message
 	m.Date = time.Now().Unix()
+	if pfs == nil { // cryptotest requires fixed timestamp
+		m.Date = 1786654144
+	}
 	m.From = db.Me
 	nr := len(nicks)
 	if nr > 100 {
@@ -145,6 +149,12 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 		}
 		binary.BigEndian.PutUint32(dst[0:4], r.My.KeyID) // associatedData
 		rand.Read(dst[4:28])                             // nonce
+		if pfs == nil { // cryptotest requires fixed nonce
+			// It would be catastrophic if this executed in production
+			// but here we know that the message will not be delivered
+			// because we're not connected to a broker.
+			copy(dst[4:28], "abcdefghijklmnopqrstuvwx")
+		}
 		dst = aead.Seal(dst[:28], dst[4:28], plaintext, dst[0:4])
 		file := fmt.Sprintf("%s/%x", nicks[i], time.Now().UnixNano())
 		if pfs != nil {
@@ -152,6 +162,8 @@ func sendTo(nicks []string, text string, msgtype MessageType) (Message, error) {
 			if err = pfs.WriteFile(file, dst); err != nil {
 				return m, fmt.Errorf("failed delivery to %s: %s", nicks[i], err)
 			}
+		} else {
+			cryptotest = append(cryptotest[:0], dst[:]...)
 		}
 	}
 	return m, nil
