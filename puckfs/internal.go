@@ -535,6 +535,9 @@ func (ringBuf *ringBuf) push(val []byte, t time.Time) (ok bool) {
 	ringBuf.p[j] = val
 	ringBuf.t[j] = t
 	ringBuf.w++
+	if ringBuf.w > (1<<30) {
+		log.Print("time to rekey (and reset seqno)")
+	}
 	return true
 }
 
