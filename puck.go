@@ -506,7 +506,7 @@ func main2() (err error) {
 		initialLoad()
 		brokerOpen()
 		defer pfs.Close()
-		if fi, err = pfs.ReadDir("in"); err != nil {
+		if fi, err = pfs.ReadDir("in/"); err != nil {
 			return fmt.Errorf("broker: in: %v", err)
 		}
 		for _, file := range fi {
