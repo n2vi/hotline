@@ -222,6 +222,9 @@ func (p *PuckFS) readPktCnt() error {
 	}
 	var sw, rw uint32
 	n, err := fmt.Sscanf(string(data), "%d %d %d", &p.greetings, &sw, &rw)
+	if n == 2 {
+		log.Fatalf("%s format changed: need timestamp as well as pkt cnt", p.sec.PktCnt)
+	}
 	if n != 3 || err != nil {
 		log.Fatalf("unable to parse %s: %d %v", p.sec.PktCnt, n, err)
 	}
