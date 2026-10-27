@@ -13,7 +13,7 @@ though in our current simulator that is merely moving the (end-to-
 end encrypted) message file from one directory to a shared broker.
 
 If you're a fellow hotline developer, I will have already sent you a secret
-file to install in $HOME/.ssh/.puckfs to talk to the broker/ROCCS-simulator
+file to install in $HOME/.ssh/.puck to talk to the broker/ROCCS-simulator
 that I run.
 If you haven't already, download the hotline source and "go install".
 Then create a directory such as $HOME/puck for your end-to-end secrets
@@ -863,7 +863,7 @@ func brokerOpen() {
 		log.Print("unable to get UserHomeDir, using .")
 		secretfile = "."
 	}
-	secretfile = filepath.Join(secretfile, ".ssh", ".puckfs")
+	secretfile = filepath.Join(secretfile, ".ssh", ".puck")
 	if pfs, err = puckfs.Dial(secretfile); err != nil {
 		log.Fatalf("unable to Dial broker: %s", err)
 	}
