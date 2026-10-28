@@ -190,6 +190,9 @@ func validateMessage(data []byte) (m Message, err error) {
 	m.MsgType = MessageType(plaintext[4:8])
 	m.Date = int64(binary.BigEndian.Uint64(plaintext[8:16]))
 	m.From = ID(binary.BigEndian.Uint32(plaintext[16:20]))
+	if sender.ID != m.From { // TODO This needs more thought.
+		log.Printf("warning! sender.ID %d != m.From %d", sender.ID, m.From)
+	}
 	nr := int(binary.BigEndian.Uint16(plaintext[20:22]))
 	m.To = make([]ID, nr)
 	for i := range nr {
