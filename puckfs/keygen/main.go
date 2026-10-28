@@ -65,7 +65,7 @@ func main() {
 	}
 	sec = sec[4:]
 	s.Secret = "chacha20poly1305:" + base64.StdEncoding.EncodeToString(sec)
-	s.ServerAddr = "h.n2vi.net:14400"
+	s.ServerAddr = "162.231.98.114:14400"
 	if narg == 1 {
 		s.ServerAddr = ":14400"
 	}
