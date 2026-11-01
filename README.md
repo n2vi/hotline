@@ -4,7 +4,7 @@ modern analog of the classic Moscow - Washington hotline
 There is interest around the world in security of nuclear crisis
 communications, a hotline that could be used by national leaders to avoid
 misunderstandings that lead to war.
-https://soundcloud.com/securityandtechnology/security-through-simplicity
+https://securityandtechnology.org/podcast/security-through-simplicity/
 
 The files here are a proof-of-concept exploration of just how
 small we can make such a system. This is still a long way from
