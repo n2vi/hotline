@@ -10,7 +10,7 @@ on the sender's broker via the "puckfs" network protocol. In theory,
 that broker would have a set of heuristics for how to deliver to the
 recipient's broker through the high-resilience ROCCS network,
 though in our current simulator that is merely moving the (end-to-
-end encrypted) message file from one directory to a shared broker.
+end encrypted) message file between directories on a shared broker.
 
 If you're a fellow hotline developer, I will have already sent you a secret
 file to install in $HOME/.ssh/.puck to talk to the broker/ROCCS-simulator

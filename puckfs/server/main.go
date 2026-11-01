@@ -13,7 +13,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/n2vi/hotline/puckfs"
+	"n2vi/hotline/puckfs"
 )
 
 var p *puckfs.PuckFS

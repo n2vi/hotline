@@ -1,4 +1,4 @@
-module github.com/n2vi/hotline
+module n2vi/hotline
 
 go 1.27
 
