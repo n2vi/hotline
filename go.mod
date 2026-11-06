@@ -1,4 +1,4 @@
-module n2vi/hotline
+module n2vi.com/hotline
 
 go 1.27
 

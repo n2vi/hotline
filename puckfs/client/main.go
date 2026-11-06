@@ -14,7 +14,7 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"n2vi/hotline/puckfs"
+	"n2vi.com/hotline/puckfs"
 )
 
 func sighandler(sig os.Signal) {

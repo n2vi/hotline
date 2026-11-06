@@ -3,7 +3,7 @@
 package puckfs
 
 // These are the network and crypto internal mechanisms. For context,
-// first read github.com/n2vi/hotline/networking.pdf.
+// first read hotline/networking.pdf.
 // A sketch of packets as encoded on the wire:
 // (~40 bytes) ether, IP, UDP header bytes which we ignore.
 // (8) ad "Associated Data": (4) KeyID, (4) seqno of this packet

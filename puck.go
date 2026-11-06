@@ -50,7 +50,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/n2vi/hotline/puckfs"
+	"n2vi.com/hotline/puckfs"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
